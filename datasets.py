@@ -43,16 +43,16 @@ def prepare(args, data_root='./data', train_data_aug=True):
         )
 
         train_loader = torch.utils.data.DataLoader(train_set, 
-            batch_size=args.batch_size, shuffle=train_data_aug, pin_memory=args.use_cuda, num_workers=4
+            batch_size=args.batch_size, shuffle=train_data_aug, pin_memory=args.use_cuda, num_workers=0
         )
         if args.val_heldout > 0:
             val_loader = torch.utils.data.DataLoader(val_set, 
-                batch_size=args.batch_size, shuffle=False, pin_memory=args.use_cuda, num_workers=4
+                batch_size=args.batch_size, shuffle=False, pin_memory=args.use_cuda, num_workers=0
             )
         else:
             val_loader = None
         test_loader = torch.utils.data.DataLoader(test_set, 
-            batch_size=args.batch_size, shuffle=False, pin_memory=args.use_cuda, num_workers=4
+            batch_size=args.batch_size, shuffle=False, pin_memory=args.use_cuda, num_workers=0
         )
 
     elif args.dataset == 'pets':

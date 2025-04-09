@@ -111,11 +111,11 @@ else:
     net0 = None
 
 if args.method == 'vanilla':
+    if __name__ == '__main__':
+        from methods.vanilla import Runner
 
-    from methods.vanilla import Runner
-
-    runner = Runner(net, net0, args, logger)
-    runner.train(train_loader, val_loader, test_loader)
+        runner = Runner(net, net0, args, logger)
+        runner.train(train_loader, val_loader, test_loader)
 
 elif args.method == 'vi':
 
@@ -132,11 +132,11 @@ elif args.method == 'mc_dropout':
     runner.train(train_loader, val_loader, test_loader)
 
 elif args.method == 'sgld':
+    if __name__ == '__main__':
+        from methods.sgld import Runner
 
-    from methods.sgld import Runner
-
-    runner = Runner(net, net0, args, logger)
-    runner.train(train_loader, val_loader, test_loader)
+        runner = Runner(net, net0, args, logger)
+        runner.train(train_loader, val_loader, test_loader)
 
 elif args.method == 'la':
 

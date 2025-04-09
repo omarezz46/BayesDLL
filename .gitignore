@@ -1,0 +1,8 @@
+/data/
+/results/
+/.vscode/
+/__pychache__/
+*.pyc
+.DS_Store
+.python-version
+

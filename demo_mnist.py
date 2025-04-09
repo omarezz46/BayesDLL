@@ -144,6 +144,13 @@ elif args.method == 'la':
     runner = Runner(net, net0, args, logger)
     runner.train(train_loader, val_loader, test_loader)
 
+elif args.method == 'sghmc':
+
+    from methods.sghmc import Runner
+
+    runner = Runner(net, net0, args, logger)
+    runner.train(train_loader, val_loader, test_loader)
+
 else:
     raise NotImplementedError
 
