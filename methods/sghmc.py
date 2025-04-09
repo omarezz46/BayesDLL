@@ -8,6 +8,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
+import torch.optim.lr_scheduler
 
 import calibration
 
@@ -35,7 +36,7 @@ class Runner:
             self.net0 = net0
         self.net0 = self.net0.to(args.device)
 
-        # workhorse network (current LD sample is maintained in here)
+        # workhorse network (current SGHMC sample is maintained in here)
         self.net = net.to(args.device)
 
         # create Hamiltonian mcmc model (nn.Module with actually no parameters)
@@ -44,7 +45,7 @@ class Runner:
             ND=args.ND, prior_sig=float(hparams['prior_sig']), bias=str(hparams['bias']), momentum_decay=float(hparams['momentum_decay'])
         ).to(args.device)
 
-        # create optimizer (for workhorse network -- to update LD sample)
+        # create optimizer (for workhorse network -- to update SGHMC sample)
         # self.optimizer = torch.optim.SGD(
         #     self.net.parameters(), 
         #     lr = args.lr, momentum = args.momentum, weight_decay = 0
@@ -56,6 +57,7 @@ class Runner:
         )
 
         # TODO: create scheduler?
+        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=5, gamma=0.5)
 
         self.criterion = torch.nn.CrossEntropyLoss()
 
@@ -105,10 +107,12 @@ class Runner:
             losses_train[ep], errors_train[ep], bi = self.train_one_epoch(
                 train_loader, collect=(ep>=self.burnin), bi=bi
             )
+            self.scheduler.step()  # update learning rate
             toc = time.time()
 
             prn_str = '[Epoch %d/%d] Training summary: ' % (ep, args.epochs)
             prn_str += 'loss = %.4f, prediction error = %.4f ' % (losses_train[ep], errors_train[ep])
+            prn_str += 'lr = %.4f ' % self.scheduler.get_lr()[0]
             prn_str += '(time: %.4f seconds)' % (toc-tic,)
             logger.info(prn_str)
 
