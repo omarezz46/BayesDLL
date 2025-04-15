@@ -12,7 +12,6 @@ import networks
 import datasets
 import utils
 
-
 parser = argparse.ArgumentParser()
 
 # method and hparams
@@ -30,6 +29,10 @@ parser.add_argument('--val_heldout', type=float, default=0.1, help='validation s
 # error calibration
 parser.add_argument('--ece_num_bins', type=int, default=15, help='number of bins for error calibration')
 
+# cyclical specific params
+parser.add_argument('--num_cycles', type=int, default=1, help='number of cycles')
+parser.add_argument('--proportion_exploration', type=float, default=0.5, help='proportion of exploration phase in each cycle')
+
 # other optim hparams
 parser.add_argument('--epochs', type=int, default=100, help='number of training epochs')
 parser.add_argument('--batch_size', type=int, default=128, help='batch size')
@@ -44,12 +47,13 @@ parser.add_argument('--test_eval_freq', type=int, default=1, help='do test evalu
 args = parser.parse_args()
 
 
-args.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
+args.device = torch.device('mps')
 args.use_cuda = torch.cuda.is_available()
 
 # random seed
 torch.manual_seed(args.seed)
 torch.cuda.manual_seed(args.seed)
+torch.mps.manual_seed(args.seed)
 torch.backends.cudnn.deterministic = True
 np.random.seed(args.seed)
 
@@ -111,11 +115,11 @@ else:
     net0 = None
 
 if args.method == 'vanilla':
-    if __name__ == '__main__':
-        from methods.vanilla import Runner
 
-        runner = Runner(net, net0, args, logger)
-        runner.train(train_loader, val_loader, test_loader)
+    from methods.vanilla import Runner
+
+    runner = Runner(net, net0, args, logger)
+    runner.train(train_loader, val_loader, test_loader)
 
 elif args.method == 'vi':
 
@@ -132,16 +136,22 @@ elif args.method == 'mc_dropout':
     runner.train(train_loader, val_loader, test_loader)
 
 elif args.method == 'sgld':
-    if __name__ == '__main__':
-        from methods.sgld import Runner
 
-        runner = Runner(net, net0, args, logger)
-        runner.train(train_loader, val_loader, test_loader)
+    from methods.sgld import Runner
+
+    runner = Runner(net, net0, args, logger)
+    runner.train(train_loader, val_loader, test_loader)
 
 elif args.method == 'la':
 
     from methods.la import Runner
 
+    runner = Runner(net, net0, args, logger)
+    runner.train(train_loader, val_loader, test_loader)
+
+elif args.method == 'csgld':
+
+    from methods.csgld import Runner
     runner = Runner(net, net0, args, logger)
     runner.train(train_loader, val_loader, test_loader)
 
