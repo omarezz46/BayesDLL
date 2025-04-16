@@ -70,6 +70,10 @@ class Runner:
         self.current_cycle = 0
         self.samples_per_cycle = {}
 
+        self.cycle_theta_means = {}  # Stores mean parameter vector for each cycle
+        self.cycle_theta_vars = {}   # Stores variance parameter vector for each cycle
+        self.cycle_likelihoods = {}  # Stores likelihoods for each sample in each cycle
+
     def train(self, train_loader, val_loader, test_loader):
         '''
         Train the model using Cyclical SGLD.
@@ -210,6 +214,7 @@ class Runner:
         
         with tqdm(train_loader, unit="batch") as tepoch:
             for batch_idx, (x, y) in enumerate(tepoch):
+                
                 # Calculate learning rate for this batch based on cycle position
                 current_lr = self.cyclical_scheduler.calculate_lr(
                     epoch=self.cyclical_scheduler.current_epoch,
@@ -274,29 +279,8 @@ class Runner:
                 error += err.item()
                 nb_samples += len(y)
                 
-                # Collect samples during sampling phase (but after initialization)
+
                 if should_sample and not just_entered_sampling:
-                    if batch_idx % 50 == 0:  # Log occasionally to reduce spam
-                        logger.info(f'Sampling phase: collecting posterior sample at lr={current_lr:.6f}')
-                    with torch.no_grad():
-                        theta_vec = nn.utils.parameters_to_vector(self.net.parameters())
-                        self.post_theta_mom1 = (theta_vec + self.post_theta_cnt*self.post_theta_mom1) / (self.post_theta_cnt+1)
-                        if self.nst > 0:  # need to maintain sample variances as well
-                            self.post_theta_mom2 = (theta_vec**2 + self.post_theta_cnt*self.post_theta_mom2) / (self.post_theta_cnt+1)
-                    self.post_theta_cnt += 1
-                    self.samples_collected += 1
-                else:
-                    # Reset flag after first batch in sampling phase
-                    just_entered_sampling = False
-                    
-                    # Log when we're in exploration phase
-                    if batch_idx % 50 == 0 and not should_sample:  # Only log occasionally to avoid spam
-                        logger.info(f'Exploration phase: lr={current_lr:.6f}')
-                
-                tepoch.set_postfix(loss=loss/nb_samples, error=error/nb_samples, lr=current_lr)
-                
-                # Handle end of cycle
-                if last_in_cycle:
                     # Get current cycle number
                     cycle_number = self.cyclical_scheduler.get_cycle_number(
                         epoch=self.cyclical_scheduler.current_epoch,
@@ -304,120 +288,200 @@ class Runner:
                         batches_per_epoch=batches_per_epoch
                     )
                     
-                    if cycle_number > self.current_cycle:
-                        cycle_updated = True
-                        self.current_cycle = cycle_number
-                        logger.info(f'Completed cycle {cycle_number}')
+                    # Determine if we should collect this sample (based on max samples per cycle)
+                    collect_this_sample = True
+
+                    if collect_this_sample:
+                        if batch_idx % 50 == 0:  # Log occasionally to reduce spam
+                            logger.info(f'Sampling phase: collecting posterior sample at lr={current_lr:.6f}')
                         
-                        # Save parameter vector for this cycle
+                        # Compute likelihood of the entire dataset (using the batch as a proxy)
+                        # This is proportional to exp(-loss * dataset_size/batch_size)
+                        likelihood = np.exp(-loss_ * self.args.ND / len(y))
+                        
+                        # Store likelihood for this sample
+                        if cycle_number not in self.cycle_likelihoods:
+                            self.cycle_likelihoods[cycle_number] = []
+                        self.cycle_likelihoods[cycle_number].append(likelihood)
+                        
+                        # Update running moments for this cycle
                         with torch.no_grad():
-                            self.save_ckpt(epoch=self.cyclical_scheduler.current_epoch)  # Reset momentum buffer for next cycle
+                            theta_vec = nn.utils.parameters_to_vector(self.net.parameters())
+                            
+                            # Initialize or update cycle-specific moments
+                            if cycle_number not in self.cycle_theta_means:
+                                self.cycle_theta_means[cycle_number] = theta_vec.clone()
+                                if self.nst > 0:
+                                    self.cycle_theta_vars[cycle_number] = theta_vec**2
+                                cycle_count = 1
+                            else:
+                                cycle_count = self.samples_per_cycle.get(cycle_number, 0) + 1
+                                self.cycle_theta_means[cycle_number] = (theta_vec + 
+                                    (cycle_count-1) * self.cycle_theta_means[cycle_number]) / cycle_count
+                                if self.nst > 0:
+                                    self.cycle_theta_vars[cycle_number] = (theta_vec**2 + 
+                                        (cycle_count-1) * self.cycle_theta_vars[cycle_number]) / cycle_count
+                            
+                            # Also update the global moments for backward compatibility
+                            self.post_theta_mom1 = (theta_vec + self.post_theta_cnt*self.post_theta_mom1) / (self.post_theta_cnt+1)
+                            if self.nst > 0:  # need to maintain sample variances as well
+                                self.post_theta_mom2 = (theta_vec**2 + self.post_theta_cnt*self.post_theta_mom2) / (self.post_theta_cnt+1)
+                        
+                        # Update counters
+                        self.post_theta_cnt += 1
+                        self.samples_collected += 1
+                        self.samples_per_cycle[cycle_number] = self.samples_per_cycle.get(cycle_number, 0) + 1
+
+                        # Handle end of cycle
+                        if last_in_cycle:
+                            # Get current cycle number
+                            cycle_number = self.cyclical_scheduler.get_cycle_number(
+                                epoch=self.cyclical_scheduler.current_epoch,
+                                batch=batch_idx,
+                                batches_per_epoch=batches_per_epoch
+                            )
+                            
+                            if cycle_number > self.current_cycle:
+                                cycle_updated = True
+                                self.current_cycle = cycle_number
+                                logger.info(f'Completed cycle {cycle_number}')
+                                
+                                # Save parameter vector for this cycle
+                                with torch.no_grad():
+                                    self.save_ckpt(epoch=self.cyclical_scheduler.current_epoch)  
+                else:
+                        # Reset flag after first batch in sampling phase
+                    just_entered_sampling = False
+                        
+                        # Log when we're in exploration phase
+                    if batch_idx % 50 == 0 and not should_sample:  # Only log occasionally to avoid spam
+                        logger.info(f'Exploration phase: lr={current_lr:.6f}')
+                    
+                    tepoch.set_postfix(loss=loss/nb_samples, error=error/nb_samples, lr=current_lr)
+                
+
         
         return loss/nb_samples, error/nb_samples, cycle_updated
 
     def evaluate(self, test_loader):
         '''
-        Prediction by sample-averaged predictive distribution, 
-            (1/S) * \sum_{i=1}^S p(y|x,theta^i) where theta^i ~ p(theta|D) from SGLD.
-
+        Prediction using the Gaussian Mixture Model from all cycles.
+        Each cycle contributes a Gaussian component with weight based on the likelihoods.
+        
         Returns:
             loss = averaged test CE loss
             err = averaged test error
             targets = all groundtruth labels
-            logits = all prediction logits (after sample average)
-            logits_all = all prediction logits (before sample average)
+            logits = all prediction logits (after weighted averaging)
+            logits_all = all prediction logits (before averaging across components)
         '''
-
         args = self.args
-
-        # get current posterior mean, vars
-        post_theta_mean, post_theta_vars = self.get_mean_vars_from_moments()
         
-        net = copy.deepcopy(self.net)  # workhorse network for this evaluation
-
-        net.eval()
+        # Calculate GMM weights based on cycle likelihoods
+        gmm_weights = self.calculate_gmm_weights()
         
-        loss, error, nb_samples, targets, logits, logits_all = 0, 0, 0, [], [], []
+        # Log the weights for insight
+        self.logger.info(f"GMM component weights: {gmm_weights}")
+        
+        # Create networks for each cycle's statistics
+        cycle_networks = {}
+        for cycle in self.cycle_theta_means.keys():
+            # Create a copy of the network for this cycle
+            net_c = copy.deepcopy(self.net)
+            cycle_networks[cycle] = net_c
+            
+            # Load the mean parameters for this cycle
+            with torch.no_grad():
+                nn.utils.vector_to_parameters(self.cycle_theta_means[cycle], net_c.parameters())
+        
+        # Evaluate on test data
+        loss, error, nb_samples = 0, 0, 0
+        targets, logits, logits_all = [], [], []
+        
         with tqdm(test_loader, unit="batch") as tepoch:
             for x, y in tepoch:
-
                 x, y = x.to(args.device), y.to(args.device)
+                
+                batch_logits_all = []
+                batch_logits = None
+                
+                # For each cycle in the mixture
+                for cycle, net_c in cycle_networks.items():
+                    net_c.eval()
+                    weight = gmm_weights.get(cycle, 0.0)
+                    
 
-                logits_all_ = []
-                if self.nst == 0:  # use just posterior mean
-                    with torch.no_grad():
-                        for p, p_m in zip(net.parameters(), post_theta_mean.parameters()):
-                            p.copy_(p_m)
-                        out = net(x)
-                    logits_all_.append(out)
-                    logits_all_ = torch.stack(logits_all_, 2)
-                    logits_ = F.log_softmax(logits_all_, 1).logsumexp(-1)
-                else:  # use posterior samples
-                    for ii in range(self.nst):  # for each sample theta ~ p(theta|D)
+                    if weight < 1e-10:
+                        continue
+                    
+                    # For each cycle, evaluate either with:
+                    component_logits = []
+                    
+                    if self.nst == 0:
+                        # Just use the mean parameters
                         with torch.no_grad():
-                            for p, p_m, p_v in zip(net.parameters(), post_theta_mean.parameters(), post_theta_vars.parameters()):
-                                eps = torch.randn_like(p)
-                                p.copy_(p_m + p_v.sqrt()*eps)
-                            out = net(x)
-                        logits_all_.append(out)
-                    logits_all_ = torch.stack(logits_all_, 2)
-                    logits_ = F.log_softmax(logits_all_, 1).logsumexp(-1) - np.log(self.nst)
-                        
-                loss_ = self.criterion(logits_, y)
-
-                # prediction on test
-                pred = logits_.data.max(dim=1)[1]
+                            out = net_c(x)
+                        component_logits.append(out)
+                    else:
+                        param_vars = copy.deepcopy(net_c)
+                        param_means = copy.deepcopy(net_c)
+                        with torch.no_grad():
+                            if cycle in self.cycle_theta_vars:
+                                nn.utils.vector_to_parameters(self.cycle_theta_vars[cycle], param_vars.parameters())
+                                nn.utils.vector_to_parameters(self.cycle_theta_means[cycle], param_means.parameters())
+                        for _ in range(self.nst):
+                            with torch.no_grad():
+                                net_sample = copy.deepcopy(net_c)
+                                
+                                for p, p_mean, p_var in zip(net_sample.parameters(), param_means.parameters(), param_vars.parameters()):
+                                    eps = torch.randn_like(p)
+                                    p.copy_(p_mean + p_var.sqrt() * eps)  # Now shapes match
+                                    
+                                out = net_sample(x)
+                            component_logits.append(out)
+                    
+                    # Stack outputs from this cycle
+                    component_logits = torch.stack(component_logits, dim=2)
+                    
+                    # Average the predictions for this component
+                    if self.nst == 0:
+                        component_out = component_logits.squeeze(2)
+                    else:
+                        component_out = F.log_softmax(component_logits, dim=1).logsumexp(-1) - np.log(self.nst)
+                    
+                    # Store for later mixture
+                    batch_logits_all.append(component_logits)
+                    
+                    # Add this component's output to the mixture (weighted)
+                    if batch_logits is None:
+                        batch_logits = weight * component_out
+                    else:
+                        batch_logits += weight * component_out
+                
+                # Stack all components for later analysis
+                batch_logits_all = torch.stack(batch_logits_all, dim=3) if batch_logits_all else torch.zeros((x.size(0), args.num_classes, 1, 1), device=args.device)
+                
+                # Calculate loss and error
+                loss_batch = self.criterion(batch_logits, y)
+                pred = batch_logits.data.max(dim=1)[1]
                 err = pred.ne(y.data).sum()
-
+                
+                # Collect statistics
                 targets.append(y.cpu().detach().numpy())
-                logits.append(logits_.cpu().detach().numpy())  # sampled-averaged logits
-                logits_all.append(logits_all_.cpu().detach().numpy())  # sample-wise logits
-                loss += loss_.item() * len(y)
+                logits.append(batch_logits.cpu().detach().numpy())
+                logits_all.append(batch_logits_all.cpu().detach().numpy())
+                loss += loss_batch.item() * len(y)
                 error += err.item()
                 nb_samples += len(y)
-
+                
                 tepoch.set_postfix(loss=loss/nb_samples, error=error/nb_samples)
-
+        
+        # Concatenate results across batches
         targets = np.concatenate(targets, axis=0)
         logits = np.concatenate(logits, axis=0)
         logits_all = np.concatenate(logits_all, axis=0)
-
+        
         return loss/nb_samples, error/nb_samples, targets, logits, logits_all
-
-    def get_mean_vars_from_moments(self):
-        '''
-        Compute posterior mean and variances from the moment statistics.
-
-        Returns:
-            post_theta_mean = net-like nn.Module with posterior mean values
-            post_theta_vars = net-like nn.Module with posterior variance values
-        '''
-        # if not hasattr(self, 'post_theta_mom1'):
-        #     # If no samples have been collected yet, return the current parameters
-        #     with torch.no_grad():
-        #         post_theta_mean = copy.deepcopy(self.net)
-        #         post_theta_vars = copy.deepcopy(self.net)
-        #         for p in post_theta_vars.parameters():
-        #             p.fill_(1e-6)  # Small default variance 
-        #     return post_theta_mean, post_theta_vars
-
-        with torch.no_grad():
-            post_theta_mean = copy.deepcopy(self.net)
-            nn.utils.vector_to_parameters(self.post_theta_mom1, post_theta_mean.parameters())
-
-        post_theta_vars = None
-        if self.nst > 0:
-            if self.post_theta_cnt > 1:
-                ratio = self.post_theta_cnt / (self.post_theta_cnt - 1)
-            else:
-                ratio = 1.0
-            with torch.no_grad():
-                post_vars_vec = ratio * (self.post_theta_mom2 - self.post_theta_mom1**2)  # unbiased estimate
-                post_vars_vec.clamp_(min=1e-12)  # to avoid numerical error
-                post_theta_vars = copy.deepcopy(self.net)
-                nn.utils.vector_to_parameters(post_vars_vec, post_theta_vars.parameters())
-
-        return post_theta_mean, post_theta_vars
 
     def save_logits(self, targets, logits, logits_all, suffix=None):
         suffix = '' if suffix is None else f'_{suffix}'
@@ -438,7 +502,10 @@ class Runner:
             {
                 'post_theta_mom1': self.post_theta_mom1 if hasattr(self, 'post_theta_mom1') else None,  
                 'post_theta_mom2': self.post_theta_mom2 if hasattr(self, 'post_theta_mom2') and self.nst > 0 else None, 
-                'post_theta_cnt': self.post_theta_cnt if hasattr(self, 'post_theta_cnt') else 0, 
+                'post_theta_cnt': self.post_theta_cnt if hasattr(self, 'post_theta_cnt') else 0,
+                'cycle_theta_means': self.cycle_theta_means,
+                'cycle_theta_vars': self.cycle_theta_vars if self.nst > 0 else None,
+                'cycle_likelihoods': self.cycle_likelihoods,
                 'prior_sig': self.model.prior_sig, 
                 'optimizer': self.optimizer.state_dict(),
                 'epoch': epoch,
@@ -459,6 +526,12 @@ class Runner:
         if ckpt['post_theta_mom2'] is not None:
             self.post_theta_mom2 = ckpt['post_theta_mom2']
         self.post_theta_cnt = ckpt.get('post_theta_cnt', 0)
+        
+        # Load GMM components
+        self.cycle_theta_means = ckpt.get('cycle_theta_means', {})
+        self.cycle_theta_vars = ckpt.get('cycle_theta_vars', {})
+        self.cycle_likelihoods = ckpt.get('cycle_likelihoods', {})
+        
         self.model.prior_sig = ckpt['prior_sig']
         self.optimizer.load_state_dict(ckpt['optimizer'])
         self.current_cycle = ckpt.get('current_cycle', 0)
@@ -466,6 +539,37 @@ class Runner:
         self.samples_per_cycle = ckpt.get('samples_per_cycle', {})
 
         return ckpt['epoch']
+    
+    def calculate_gmm_weights(self):
+        """
+        Calculate weights for each cycle in the Gaussian Mixture Model.
+        Uses the formula: w_c = [ (1/K_c) * sum(1/p(D|θ_j^c)) ]^-1
+        """
+        weights = {}
+        
+        # Return early if no cycles collected
+        if not self.cycle_likelihoods:
+            return {0: 1.0}
+        
+        # Calculate weights for each cycle
+        for cycle, likelihoods in self.cycle_likelihoods.items():
+            if not likelihoods:
+                weights[cycle] = 0.0
+                continue
+                
+            # Compute inverse average inverse likelihood
+            avg_inv_likelihood = np.mean([1.0/likelihood for likelihood in likelihoods])
+            weights[cycle] = 1.0 / avg_inv_likelihood
+        
+        # Normalize weights to sum to 1
+        total_weight = sum(weights.values())
+        if total_weight > 0:
+            weights = {c: w/total_weight for c, w in weights.items()}
+        else:
+            # If all weights are zero, use uniform weights
+            weights = {c: 1.0/len(weights) for c in weights}
+        
+        return weights
 
     
 class Model(nn.Module):
