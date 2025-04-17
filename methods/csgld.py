@@ -414,7 +414,6 @@ class Runner:
                     if weight < 1e-10:
                         continue
                     
-                    # For each cycle, evaluate either with:
                     component_logits = []
                     
                     if self.nst == 0:
@@ -424,18 +423,16 @@ class Runner:
                         component_logits.append(out)
                     else:
                         param_vars = copy.deepcopy(net_c)
-                        param_means = copy.deepcopy(net_c)
                         with torch.no_grad():
                             if cycle in self.cycle_theta_vars:
                                 nn.utils.vector_to_parameters(self.cycle_theta_vars[cycle], param_vars.parameters())
-                                nn.utils.vector_to_parameters(self.cycle_theta_means[cycle], param_means.parameters())
                         for _ in range(self.nst):
                             with torch.no_grad():
                                 net_sample = copy.deepcopy(net_c)
                                 
-                                for p, p_mean, p_var in zip(net_sample.parameters(), param_means.parameters(), param_vars.parameters()):
+                                for p, p_var in zip(net_sample.parameters(), param_vars.parameters()):
                                     eps = torch.randn_like(p)
-                                    p.copy_(p_mean + p_var.sqrt() * eps)  # Now shapes match
+                                    p.copy_(p + p_var.sqrt() * eps)  # Now shapes match
                                     
                                 out = net_sample(x)
                             component_logits.append(out)
