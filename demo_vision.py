@@ -47,7 +47,14 @@ parser.add_argument('--test_eval_freq', type=int, default=1, help='do test evalu
 args = parser.parse_args()
 
 
-args.device = torch.device('mps')
+if torch.cuda.is_available():
+    args.device = torch.device('cuda')
+elif torch.backends.mps.is_available():
+    args.device = torch.device('mps')
+else:
+    args.device = torch.device('cpu')
+
+# args.device = torch.device('cuda') if torch.cuda.is_available() else torch.device('cpu')
 args.use_cuda = torch.cuda.is_available()
 
 # random seed
