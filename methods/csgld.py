@@ -63,15 +63,15 @@ class Runner:
 
         self.Ninflate = float(hparams['Ninflate'])  # N inflation factor (factor in data augmentation)
         self.nd = float(hparams['nd'])  # noise discount
-        self.nst = int(hparams['nst'])  # number of samples at test time
+        self.nst = int(hparams['nst'])  # number of samples for test-val
         
         # Initialize sample collection variables
         self.samples_collected = 0
         self.current_cycle = 0
         self.samples_per_cycle = {}
 
-        self.cycle_theta_means = {}  # Stores mean parameter vector for each cycle
-        self.cycle_theta_vars = {}   # Stores variance parameter vector for each cycle
+        self.cycle_theta_mom1 = {}  # Stores mean parameter vector for each cycle
+        self.cycle_theta_mom2 = {}   # Stores variance parameter vector for each cycle
         self.cycle_likelihoods = {}  # Stores likelihoods for each sample in each cycle
 
     def train(self, train_loader, val_loader, test_loader):
@@ -207,8 +207,6 @@ class Runner:
         self.net.train()
         
         loss, error, nb_samples = 0, 0, 0
-        in_sampling_phase = False
-        just_entered_sampling = False
         cycle_updated = False
         batches_per_epoch = len(train_loader)
         
@@ -235,21 +233,6 @@ class Runner:
                     batch=batch_idx,
                     batches_per_epoch=batches_per_epoch
                 )
-                
-                # Detect transition into sampling phase
-                if should_sample and not in_sampling_phase:
-                    just_entered_sampling = True
-                    in_sampling_phase = True
-                    logger.info('Entering sampling phase - initializing posterior sample averages')
-                    # Initialize posterior sample aggregation
-                    with torch.no_grad():
-                        theta_vec = nn.utils.parameters_to_vector(self.net.parameters())
-                        self.post_theta_mom1 = theta_vec * 1.0  # 1st moment
-                        if self.nst > 0:  # need to maintain sample variances as well
-                            self.post_theta_mom2 = theta_vec**2  # 2nd moment
-                        self.post_theta_cnt = 1
-                elif not should_sample:
-                    in_sampling_phase = False
                 
                 # Update optimizer learning rates for both body and head
                 for i, param_group in enumerate(self.optimizer.param_groups):
@@ -280,80 +263,62 @@ class Runner:
                 nb_samples += len(y)
                 
 
-                if should_sample and not just_entered_sampling:
+                if should_sample :
                     # Get current cycle number
                     cycle_number = self.cyclical_scheduler.get_cycle_number(
                         epoch=self.cyclical_scheduler.current_epoch,
                         batch=batch_idx,
                         batches_per_epoch=batches_per_epoch
                     )
+
+                    logger.info(f'Sampling phase: collecting posterior sample at lr={current_lr:.6f}')
                     
-                    # Determine if we should collect this sample (based on max samples per cycle)
-                    collect_this_sample = True
+                    # Compute likelihood of the entire dataset (using the batch as a proxy)
+                    # This is proportional to exp(-loss * dataset_size/batch_size)
+                    likelihood = np.exp(-loss_ * self.args.ND / len(y))
+                    
+                    # Store likelihood for this sample
+                    if cycle_number not in self.cycle_likelihoods:
+                        self.cycle_likelihoods[cycle_number] = []
+                    self.cycle_likelihoods[cycle_number].append(likelihood)
+                    
+                    # Update running moments for this cycle
+                    with torch.no_grad():
+                        theta_vec = nn.utils.parameters_to_vector(self.net.parameters())
+                        
+                        # Initialize or update cycle-specific moments
+                        if cycle_number not in self.cycle_theta_mom1:
+                            self.cycle_theta_mom1[cycle_number] = theta_vec.clone()
+                            self.cycle_theta_mom2[cycle_number] = theta_vec**2
+                        else:
+                            cycle_count = self.samples_per_cycle.get(cycle_number, 0) + 1
+                            self.cycle_theta_mom1[cycle_number] = (theta_vec + 
+                                (cycle_count-1) * self.cycle_theta_mom1[cycle_number]) / cycle_count
+                            self.cycle_theta_mom2[cycle_number] = (theta_vec**2 + 
+                                    (cycle_count-1) * self.cycle_theta_mom2[cycle_number]) / cycle_count
+                    
+                    self.samples_collected += 1
+                    self.samples_per_cycle[cycle_number] = self.samples_per_cycle.get(cycle_number, 0) + 1
 
-                    if collect_this_sample:
-                        if batch_idx % 50 == 0:  # Log occasionally to reduce spam
-                            logger.info(f'Sampling phase: collecting posterior sample at lr={current_lr:.6f}')
+                    # Handle end of cycle
+                    if last_in_cycle:
+                        # Get current cycle number
+                        cycle_number = self.cyclical_scheduler.get_cycle_number(
+                            epoch=self.cyclical_scheduler.current_epoch,
+                            batch=batch_idx,
+                            batches_per_epoch=batches_per_epoch
+                        )
                         
-                        # Compute likelihood of the entire dataset (using the batch as a proxy)
-                        # This is proportional to exp(-loss * dataset_size/batch_size)
-                        likelihood = np.exp(-loss_ * self.args.ND / len(y))
-                        
-                        # Store likelihood for this sample
-                        if cycle_number not in self.cycle_likelihoods:
-                            self.cycle_likelihoods[cycle_number] = []
-                        self.cycle_likelihoods[cycle_number].append(likelihood)
-                        
-                        # Update running moments for this cycle
-                        with torch.no_grad():
-                            theta_vec = nn.utils.parameters_to_vector(self.net.parameters())
+                        if cycle_number > self.current_cycle:
+                            cycle_updated = True
+                            self.current_cycle = cycle_number
+                            logger.info(f'Completed cycle {cycle_number}')
                             
-                            # Initialize or update cycle-specific moments
-                            if cycle_number not in self.cycle_theta_means:
-                                self.cycle_theta_means[cycle_number] = theta_vec.clone()
-                                if self.nst > 0:
-                                    self.cycle_theta_vars[cycle_number] = theta_vec**2
-                                cycle_count = 1
-                            else:
-                                cycle_count = self.samples_per_cycle.get(cycle_number, 0) + 1
-                                self.cycle_theta_means[cycle_number] = (theta_vec + 
-                                    (cycle_count-1) * self.cycle_theta_means[cycle_number]) / cycle_count
-                                if self.nst > 0:
-                                    self.cycle_theta_vars[cycle_number] = (theta_vec**2 + 
-                                        (cycle_count-1) * self.cycle_theta_vars[cycle_number]) / cycle_count
-                            
-                            # Also update the global moments for backward compatibility
-                            self.post_theta_mom1 = (theta_vec + self.post_theta_cnt*self.post_theta_mom1) / (self.post_theta_cnt+1)
-                            if self.nst > 0:  # need to maintain sample variances as well
-                                self.post_theta_mom2 = (theta_vec**2 + self.post_theta_cnt*self.post_theta_mom2) / (self.post_theta_cnt+1)
-                        
-                        # Update counters
-                        self.post_theta_cnt += 1
-                        self.samples_collected += 1
-                        self.samples_per_cycle[cycle_number] = self.samples_per_cycle.get(cycle_number, 0) + 1
-
-                        # Handle end of cycle
-                        if last_in_cycle:
-                            # Get current cycle number
-                            cycle_number = self.cyclical_scheduler.get_cycle_number(
-                                epoch=self.cyclical_scheduler.current_epoch,
-                                batch=batch_idx,
-                                batches_per_epoch=batches_per_epoch
-                            )
-                            
-                            if cycle_number > self.current_cycle:
-                                cycle_updated = True
-                                self.current_cycle = cycle_number
-                                logger.info(f'Completed cycle {cycle_number}')
-                                
-                                # Save parameter vector for this cycle
-                                with torch.no_grad():
-                                    self.save_ckpt(epoch=self.cyclical_scheduler.current_epoch)  
+                            # Save parameter vector for this cycle
+                            with torch.no_grad():
+                                self.save_ckpt(epoch=self.cyclical_scheduler.current_epoch)
                 else:
-                        # Reset flag after first batch in sampling phase
-                    just_entered_sampling = False
-                        
-                        # Log when we're in exploration phase
+                    # Log when we're in exploration phase
                     if batch_idx % 50 == 0 and not should_sample:  # Only log occasionally to avoid spam
                         logger.info(f'Exploration phase: lr={current_lr:.6f}')
                     
@@ -385,14 +350,14 @@ class Runner:
         
         # Create networks for each cycle's statistics
         cycle_networks = {}
-        for cycle in self.cycle_theta_means.keys():
+        for cycle in self.cycle_theta.mom1.keys():
             # Create a copy of the network for this cycle
             net_c = copy.deepcopy(self.net)
             cycle_networks[cycle] = net_c
             
             # Load the mean parameters for this cycle
             with torch.no_grad():
-                nn.utils.vector_to_parameters(self.cycle_theta_means[cycle], net_c.parameters())
+                nn.utils.vector_to_parameters(self.cycle_theta_mom1[cycle], net_c.parameters())
         
         # Evaluate on test data
         loss, error, nb_samples = 0, 0, 0
@@ -423,16 +388,20 @@ class Runner:
                         component_logits.append(out)
                     else:
                         param_vars = copy.deepcopy(net_c)
+                        param_means = copy.deepcopy(net_c)
                         with torch.no_grad():
-                            if cycle in self.cycle_theta_vars:
-                                nn.utils.vector_to_parameters(self.cycle_theta_vars[cycle], param_vars.parameters())
+                            if cycle in self.cycle_theta_mom2:
+                                ratio = self.samples_per_cycle.get(cycle, 0) / (self.samples_per_cycle.get(cycle, 0) - 1)
+                                cycle_variance = ratio * (self.cycle_theta_mom2[cycle] - self.cycle_theta_mom1**2)
+                                nn.utils.vector_to_parameters(cycle_variance, param_vars.parameters())
+                                nn.utils.vector_to_parameters(self.cycle_theta_mom1[cycle], param_means.parameters())
                         for _ in range(self.nst):
                             with torch.no_grad():
                                 net_sample = copy.deepcopy(net_c)
                                 
-                                for p, p_var in zip(net_sample.parameters(), param_vars.parameters()):
+                                for p, p_mean, p_var in zip(net_sample.parameters(), param_means.parameters(), param_vars.parameters()):
                                     eps = torch.randn_like(p)
-                                    p.copy_(p + p_var.sqrt() * eps)  # Now shapes match
+                                    p.copy_(p_mean + p_var.sqrt() * eps)  # Now shapes match
                                     
                                 out = net_sample(x)
                             component_logits.append(out)
@@ -497,11 +466,8 @@ class Runner:
 
         torch.save(
             {
-                'post_theta_mom1': self.post_theta_mom1 if hasattr(self, 'post_theta_mom1') else None,  
-                'post_theta_mom2': self.post_theta_mom2 if hasattr(self, 'post_theta_mom2') and self.nst > 0 else None, 
-                'post_theta_cnt': self.post_theta_cnt if hasattr(self, 'post_theta_cnt') else 0,
-                'cycle_theta_means': self.cycle_theta_means,
-                'cycle_theta_vars': self.cycle_theta_vars if self.nst > 0 else None,
+                'cycle_theta_mom1': self.cycle_theta_mom1,
+                'cycle_theta_mom2': self.cycle_theta_mom2,
                 'cycle_likelihoods': self.cycle_likelihoods,
                 'prior_sig': self.model.prior_sig, 
                 'optimizer': self.optimizer.state_dict(),
@@ -517,16 +483,10 @@ class Runner:
 
     def load_ckpt(self, ckpt_path):
         ckpt = torch.load(ckpt_path, map_location=self.args.device)
-
-        if ckpt['post_theta_mom1'] is not None:
-            self.post_theta_mom1 = ckpt['post_theta_mom1']
-        if ckpt['post_theta_mom2'] is not None:
-            self.post_theta_mom2 = ckpt['post_theta_mom2']
-        self.post_theta_cnt = ckpt.get('post_theta_cnt', 0)
         
         # Load GMM components
-        self.cycle_theta_means = ckpt.get('cycle_theta_means', {})
-        self.cycle_theta_vars = ckpt.get('cycle_theta_vars', {})
+        self.cycle_theta_mom1 = ckpt.get('cycle_theta_mom1', {})
+        self.cycle_theta_mom2 = ckpt.get('cycle_theta_mom2', {})
         self.cycle_likelihoods = ckpt.get('cycle_likelihoods', {})
         
         self.model.prior_sig = ckpt['prior_sig']
