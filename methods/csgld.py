@@ -350,7 +350,7 @@ class Runner:
         
         # Create networks for each cycle's statistics
         cycle_networks = {}
-        for cycle in self.cycle_theta.mom1.keys():
+        for cycle in self.cycle_theta_mom1.keys():
             # Create a copy of the network for this cycle
             net_c = copy.deepcopy(self.net)
             cycle_networks[cycle] = net_c
@@ -392,7 +392,8 @@ class Runner:
                         with torch.no_grad():
                             if cycle in self.cycle_theta_mom2:
                                 ratio = self.samples_per_cycle.get(cycle, 0) / (self.samples_per_cycle.get(cycle, 0) - 1)
-                                cycle_variance = ratio * (self.cycle_theta_mom2[cycle] - self.cycle_theta_mom1**2)
+                                cycle_variance = ratio * (self.cycle_theta_mom2[cycle] - self.cycle_theta_mom1[cycle]**2)
+                                cycle_variance.clamp_(min=1e-12)
                                 nn.utils.vector_to_parameters(cycle_variance, param_vars.parameters())
                                 nn.utils.vector_to_parameters(self.cycle_theta_mom1[cycle], param_means.parameters())
                         for _ in range(self.nst):
