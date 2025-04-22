@@ -148,8 +148,8 @@ class Runner:
                     logger.info(f'Logits on test set saved at {fname}')
                     
                     # save checkpoint
-                    fname = self.save_ckpt(ep)  # save checkpoint
-                    logger.info(f'Checkpoint saved at {fname}')
+                    # fname = self.save_ckpt(ep)  # save checkpoint
+                    # logger.info(f'Checkpoint saved at {fname}')
 
                     # perform error calibration (ECE, MCE, reliability plot, etc.)
                     ece_no_ts, mce_no_ts, nll_no_ts = calibration.analyze(
@@ -270,8 +270,9 @@ class Runner:
                         batch=batch_idx,
                         batches_per_epoch=batches_per_epoch
                     )
-
-                    logger.info(f'Sampling phase: collecting posterior sample at lr={current_lr:.6f}')
+                    # Log when we're in sampling phase
+                    if batch_idx % 50 == 0:  # Only log occasionally to avoid spam
+                        logger.info(f'Sampling phase: collecting posterior sample at lr={current_lr:.6f}')
                     
                     # Compute likelihood of the entire dataset (using the batch as a proxy)
                     # This is proportional to exp(-loss * dataset_size/batch_size)
@@ -315,8 +316,8 @@ class Runner:
                             logger.info(f'Completed cycle {cycle_number}')
                             
                             # Save parameter vector for this cycle
-                            with torch.no_grad():
-                                self.save_ckpt(epoch=self.cyclical_scheduler.current_epoch)
+                            # with torch.no_grad():
+                            #     self.save_ckpt(epoch=self.cyclical_scheduler.current_epoch)
                 else:
                     # Log when we're in exploration phase
                     if batch_idx % 50 == 0 and not should_sample:  # Only log occasionally to avoid spam
