@@ -273,14 +273,14 @@ class Runner:
 
                     logger.info(f'Sampling phase: collecting posterior sample at lr={current_lr:.6f}')
                     
-                    # Compute likelihood of the entire dataset (using the batch as a proxy)
-                    # This is proportional to exp(-loss * dataset_size/batch_size)
-                    likelihood = np.exp(-loss_ * self.args.ND / len(y))
+                    # # Compute likelihood of the entire dataset (using the batch as a proxy)
+                    # # This is proportional to exp(-loss * dataset_size/batch_size)
+                    # likelihood = np.exp(-loss_ * self.args.ND / len(y))
                     
-                    # Store likelihood for this sample
-                    if cycle_number not in self.cycle_likelihoods:
-                        self.cycle_likelihoods[cycle_number] = []
-                    self.cycle_likelihoods[cycle_number].append(likelihood)
+                    # # Store likelihood for this sample
+                    # if cycle_number not in self.cycle_likelihoods:
+                    #     self.cycle_likelihoods[cycle_number] = []
+                    # self.cycle_likelihoods[cycle_number].append(likelihood)
                     
                     # Update running moments for this cycle
                     with torch.no_grad():
@@ -314,6 +314,13 @@ class Runner:
                             self.current_cycle = cycle_number
                             logger.info(f'Completed cycle {cycle_number}')
                             
+                            # Calculate full batch likelihood for this cycle's model
+                            likelihood = self.full_batch_likelihoods(train_loader)
+                            
+                            # Store the likelihood for this cycle
+                            self.cycle_likelihoods[cycle_number] = likelihood
+                            logger.info(f'Cycle {cycle_number} full batch likelihood: {likelihood:.6e}')
+
                             # Save parameter vector for this cycle
                             with torch.no_grad():
                                 self.save_ckpt(epoch=self.cyclical_scheduler.current_epoch)
@@ -469,7 +476,7 @@ class Runner:
             {
                 'cycle_theta_mom1': self.cycle_theta_mom1,
                 'cycle_theta_mom2': self.cycle_theta_mom2,
-                'cycle_likelihoods': self.cycle_likelihoods,
+                # 'cycle_likelihoods': self.cycle_likelihoods,
                 'prior_sig': self.model.prior_sig, 
                 'optimizer': self.optimizer.state_dict(),
                 'epoch': epoch,
@@ -488,7 +495,7 @@ class Runner:
         # Load GMM components
         self.cycle_theta_mom1 = ckpt.get('cycle_theta_mom1', {})
         self.cycle_theta_mom2 = ckpt.get('cycle_theta_mom2', {})
-        self.cycle_likelihoods = ckpt.get('cycle_likelihoods', {})
+        # self.cycle_likelihoods = ckpt.get('cycle_likelihoods', {})
         
         self.model.prior_sig = ckpt['prior_sig']
         self.optimizer.load_state_dict(ckpt['optimizer'])
@@ -497,6 +504,32 @@ class Runner:
         self.samples_per_cycle = ckpt.get('samples_per_cycle', {})
 
         return ckpt['epoch']
+    
+    def full_batch_likelihoods(self, train_loader):
+        """
+        Calculate full-batch log-likelihood for the current model.
+        Returns the likelihood value (not negative log-likelihood).
+        """
+        self.logger.info("Calculating full-batch likelihood for current cycle...")
+        self.net.eval()  # Set model to evaluation mode
+        
+        total_loss = 0.0
+        num_samples = 0
+        
+        with torch.no_grad():  # Disable gradient calculation
+            for x, y in tqdm(train_loader, desc="Likelihood calculation"):
+                x, y = x.to(self.args.device), y.to(self.args.device)
+                out = self.net(x)
+                loss = self.criterion(out, y)
+                total_loss += loss.item() * len(y)
+                num_samples += len(y)
+        
+        avg_loss = total_loss / num_samples
+        likelihood = np.exp(-avg_loss)  # Convert loss to likelihood
+        
+        self.logger.info(f"Full batch average loss: {avg_loss:.6f}, likelihood: {likelihood:.6e}")
+        
+        return likelihood
     
     def calculate_gmm_weights(self):
         """
