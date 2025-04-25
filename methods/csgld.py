@@ -146,10 +146,6 @@ class Runner:
                         targets_test, logits_test, logits_all_test, suffix='test'
                     )  # save prediction logits on test set
                     logger.info(f'Logits on test set saved at {fname}')
-                    
-                    # save checkpoint
-                    # fname = self.save_ckpt(ep)  # save checkpoint
-                    # logger.info(f'Checkpoint saved at {fname}')
 
                     # perform error calibration (ECE, MCE, reliability plot, etc.)
                     ece_no_ts, mce_no_ts, nll_no_ts = calibration.analyze(
@@ -212,22 +208,18 @@ class Runner:
         
         with tqdm(train_loader, unit="batch") as tepoch:
             for batch_idx, (x, y) in enumerate(tepoch):
-                
-                # Calculate learning rate for this batch based on cycle position
                 current_lr = self.cyclical_scheduler.calculate_lr(
                     epoch=self.cyclical_scheduler.current_epoch,
                     batch=batch_idx,
                     batches_per_epoch=batches_per_epoch
                 )
-                
-                # Check if we should collect samples based on cycle position
+        
                 should_sample = self.cyclical_scheduler.should_sample(
                     epoch=self.cyclical_scheduler.current_epoch,
                     batch=batch_idx,
                     batches_per_epoch=batches_per_epoch
                 )
                 
-                # Check if this is the last batch in the current cycle
                 last_in_cycle = self.cyclical_scheduler.last_in_cycle(
                     epoch=self.cyclical_scheduler.current_epoch,
                     batch=batch_idx,
@@ -274,15 +266,6 @@ class Runner:
                     if batch_idx % 50 == 0:  # Only log occasionally to avoid spam
                         logger.info(f'Sampling phase: collecting posterior sample at lr={current_lr:.6f}')
                     
-                    # # Compute likelihood of the entire dataset (using the batch as a proxy)
-                    # # This is proportional to exp(-loss * dataset_size/batch_size)
-                    # likelihood = np.exp(-loss_ * self.args.ND / len(y))
-                    
-                    # # Store likelihood for this sample
-                    # if cycle_number not in self.cycle_likelihoods:
-                    #     self.cycle_likelihoods[cycle_number] = []
-                    # self.cycle_likelihoods[cycle_number].append(likelihood)
-                    
                     # Update running moments for this cycle
                     with torch.no_grad():
                         theta_vec = nn.utils.parameters_to_vector(self.net.parameters())
@@ -316,15 +299,15 @@ class Runner:
                             logger.info(f'Completed cycle {cycle_number}')
                             
                             # Calculate full batch likelihood for this cycle's model
-                            likelihood = self.full_batch_likelihoods(train_loader)
+                            likelihood = np.array(self.full_batch_likelihoods(train_loader))
                             
                             # Store the likelihood for this cycle
                             self.cycle_likelihoods[cycle_number] = likelihood
-                            logger.info(f'Cycle {cycle_number} full batch likelihood: {likelihood:.6e}')
+                            logger.info(f'Cycle {cycle_number} full batch likelihood: {likelihood.mean():.6e}')
 
                             # Save parameter vector for this cycle
-                            # with torch.no_grad():
-                            #     self.save_ckpt(epoch=self.cyclical_scheduler.current_epoch)
+                            with torch.no_grad():
+                                self.save_ckpt(epoch=self.cyclical_scheduler.current_epoch)
                 else:
                     # Log when we're in exploration phase
                     if batch_idx % 50 == 0 and not should_sample:  # Only log occasionally to avoid spam
@@ -471,19 +454,19 @@ class Runner:
         return fname
 
     def save_ckpt(self, epoch):
-        fname = os.path.join(self.args.log_dir, f"ckpt.pt")
+        fname = os.path.join(self.args.log_dir, f"{self.current_cycle}_ckpt.pt")
 
         torch.save(
             {
                 'cycle_theta_mom1': self.cycle_theta_mom1,
                 'cycle_theta_mom2': self.cycle_theta_mom2,
-                # 'cycle_likelihoods': self.cycle_likelihoods,
-                'prior_sig': self.model.prior_sig, 
-                'optimizer': self.optimizer.state_dict(),
+                'cycle_likelihoods': self.cycle_likelihoods,
+                # 'prior_sig': self.model.prior_sig, 
+                # 'optimizer': self.optimizer.state_dict(),
                 'epoch': epoch,
                 'current_cycle': self.current_cycle,
-                'samples_collected': self.samples_collected,
-                'samples_per_cycle': self.samples_per_cycle
+                # 'samples_collected': self.samples_collected,
+                # 'samples_per_cycle': self.samples_per_cycle
             },
             fname
         )
@@ -506,31 +489,45 @@ class Runner:
 
         return ckpt['epoch']
     
-    def full_batch_likelihoods(self, train_loader):
-        """
-        Calculate full-batch log-likelihood for the current model.
-        Returns the likelihood value (not negative log-likelihood).
-        """
-        self.logger.info("Calculating full-batch likelihood for current cycle...")
+    def full_batch_likelihoods(self, train_loader, num_samples=10):
+        self.logger.info(f"Calculating full-batch likelihood for current cycle with {num_samples} samples...")
         self.net.eval()  # Set model to evaluation mode
+
+        cycle = self.current_cycle
+        all_likelihoods = []
         
-        total_loss = 0.0
-        num_samples = 0
+        # For each sample
+        for sample_idx in range(num_samples):
+            # Create perturbed parameters for this sample
+            with torch.no_grad():
+                param_vars = copy.deepcopy(self.net)
+                param_means = copy.deepcopy(self.net)
+                net_sample = copy.deepcopy(self.net)
+                ratio = self.samples_per_cycle.get(cycle, 0) / (self.samples_per_cycle.get(cycle, 0) - 1)
+                cycle_variance = ratio * (self.cycle_theta_mom2[cycle] - self.cycle_theta_mom1[cycle]**2)
+                cycle_variance.clamp_(min=1e-12)
+                nn.utils.vector_to_parameters(cycle_variance, param_vars.parameters())
+                nn.utils.vector_to_parameters(self.cycle_theta_mom1[cycle], param_means.parameters())
+                for p, p_mean, p_var in zip(net_sample.parameters(), param_means.parameters(), param_vars.parameters()):
+                    eps = torch.randn_like(p)
+                    p.copy_(p_mean + p_var.sqrt() * eps) 
+            
+                # Calculate likelihood with these parameters
+                total_loss = 0.0
+                num_data_points = 0
+                for x, y in tqdm(train_loader, desc=f"Likelihood calculation (sample {sample_idx+1}/{num_samples})"):
+                    x, y = x.to(self.args.device), y.to(self.args.device)
+                    out = net_sample(x)
+                    loss = self.criterion(out, y)
+                    total_loss += loss.item() * len(y)
+                    num_data_points += len(y)
+            
+            avg_loss = total_loss / num_data_points
+            likelihood = np.exp(-avg_loss)  # Convert loss to likelihood
+            
+            all_likelihoods.append(likelihood)
         
-        with torch.no_grad():  # Disable gradient calculation
-            for x, y in tqdm(train_loader, desc="Likelihood calculation"):
-                x, y = x.to(self.args.device), y.to(self.args.device)
-                out = self.net(x)
-                loss = self.criterion(out, y)
-                total_loss += loss.item() * len(y)
-                num_samples += len(y)
-        
-        avg_loss = total_loss / num_samples
-        likelihood = np.exp(-avg_loss)  # Convert loss to likelihood
-        
-        self.logger.info(f"Full batch average loss: {avg_loss:.6f}, likelihood: {likelihood:.6e}")
-        
-        return likelihood
+        return all_likelihoods
     
     def calculate_gmm_weights(self):
         """
@@ -545,9 +542,9 @@ class Runner:
         
         # Calculate weights for each cycle
         for cycle, likelihoods in self.cycle_likelihoods.items():
-            if not likelihoods:
-                weights[cycle] = 0.0
-                continue
+            # if not likelihoods:
+            #     weights[cycle] = 0.0
+            #     continue
                 
             # Compute inverse average inverse likelihood
             avg_inv_likelihood = np.mean([1.0/likelihood for likelihood in likelihoods])
