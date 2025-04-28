@@ -244,6 +244,8 @@ class Runner:
                     self.Ninflate, self.nd
                 )
                 
+                torch.nn.utils.clip_grad_norm_(self.net.parameters(), args.clip_grad)
+
                 self.optimizer.step()  # update self.net (ie, theta)
                 
                 # Prediction on training
