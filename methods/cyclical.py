@@ -28,7 +28,6 @@ class CyclicalSGMCMC:
     
     def calculate_lr(self, epoch, batch, batches_per_epoch):
         """Calculate the learning rate based on current position in cycle."""
-
         K = self.epochs * batches_per_epoch
         cycle_length = K // self.number_of_cycles
         k = epoch * batches_per_epoch + batch + 1
@@ -36,7 +35,13 @@ class CyclicalSGMCMC:
         # normalized cycle position
         cycle_pos = ((k - 1) % cycle_length) / cycle_length
         
-        return self.base_lr * (1 + np.cos(cycle_pos * np.pi)) / 2
+        # If we're in the sampling/exploitation phase, keep learning rate constant
+        if cycle_pos >= self.proportion_exploration:
+            # Return the learning rate at the exploration/exploitation boundary
+            return self.base_lr * (1 + np.cos(self.proportion_exploration * np.pi)) / 2
+        else:
+            # In exploration phase, continue with normal cosine schedule
+            return self.base_lr * (1 + np.cos(cycle_pos * np.pi)) / 2
 
     
     def should_sample(self, epoch, batch, batches_per_epoch):
