@@ -286,30 +286,6 @@ class Runner:
                     self.samples_collected += 1
                     self.samples_per_cycle[cycle_number] = self.samples_per_cycle.get(cycle_number, 0) + 1
 
-                    # Handle end of cycle
-                    if last_in_cycle:
-                        # Get current cycle number
-                        cycle_number = self.cyclical_scheduler.get_cycle_number(
-                            epoch=self.cyclical_scheduler.current_epoch,
-                            batch=batch_idx,
-                            batches_per_epoch=batches_per_epoch
-                        )
-                        
-                        if cycle_number > self.current_cycle:
-                            cycle_updated = True
-                            self.current_cycle = cycle_number
-                            logger.info(f'Completed cycle {cycle_number}')
-                            
-                            # Calculate full batch likelihood for this cycle's model
-                            likelihood = np.array(self.full_batch_likelihoods(train_loader))
-                            
-                            # Store the likelihood for this cycle
-                            self.cycle_likelihoods[cycle_number] = likelihood
-                            logger.info(f'Cycle {cycle_number} full batch likelihood: {likelihood.mean():.6e}')
-
-                            # Save parameter vector for this cycle
-                            with torch.no_grad():
-                                self.save_ckpt(epoch=self.cyclical_scheduler.current_epoch)
                 else:
                     # Log when we're in exploration phase
                     if batch_idx % 50 == 0 and not should_sample:  # Only log occasionally to avoid spam
@@ -317,7 +293,30 @@ class Runner:
                     
                     tepoch.set_postfix(loss=loss/nb_samples, error=error/nb_samples, lr=current_lr)
                 
+                # Handle end of cycle
+                if last_in_cycle:
+                    # Get current cycle number
+                    cycle_number = self.cyclical_scheduler.get_cycle_number(
+                        epoch=self.cyclical_scheduler.current_epoch,
+                        batch=batch_idx,
+                        batches_per_epoch=batches_per_epoch
+                    )
+                    
+                    if cycle_number > self.current_cycle:
+                        cycle_updated = True
+                        self.current_cycle = cycle_number
+                        logger.info(f'Completed cycle {cycle_number}')
+                        
+                        # Calculate full batch likelihood for this cycle's model
+                        likelihood = np.array(self.full_batch_likelihoods(train_loader, num_samples=self.nst))
+                        
+                        # Store the likelihood for this cycle
+                        self.cycle_likelihoods[cycle_number] = likelihood
+                        logger.info(f'Cycle {cycle_number} full batch likelihood: {likelihood.mean():.6e}')
 
+                        # Save parameter vector for this cycle
+                        with torch.no_grad():
+                            self.save_ckpt(epoch=self.cyclical_scheduler.current_epoch)
         
         return loss/nb_samples, error/nb_samples, cycle_updated
 
