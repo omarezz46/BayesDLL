@@ -64,6 +64,7 @@ class Runner:
         self.Ninflate = float(hparams['Ninflate'])  # N inflation factor (factor in data augmentation)
         self.nd = float(hparams['nd'])  # noise discount
         self.nst = int(hparams['nst'])  # number of samples for test-val
+        self.thin = int(hparams['thin'])  # thinning factor for sampling
         
         # Initialize sample collection variables
         self.samples_collected = 0
@@ -73,6 +74,8 @@ class Runner:
         self.cycle_theta_mom1 = {}  # Stores mean parameter vector for each cycle
         self.cycle_theta_mom2 = {}   # Stores variance parameter vector for each cycle
         self.cycle_likelihoods = {}  # Stores likelihoods for each sample in each cycle
+
+        # self.all_samples = {}  # Stores all samples collected so far
 
     def train(self, train_loader, val_loader, test_loader):
         '''
@@ -218,7 +221,7 @@ class Runner:
                     epoch=self.cyclical_scheduler.current_epoch,
                     batch=batch_idx,
                     batches_per_epoch=batches_per_epoch
-                ) and batch_idx % args.thin == 0
+                ) and batch_idx % self.thin == 0
                 
                 last_in_cycle = self.cyclical_scheduler.last_in_cycle(
                     epoch=self.cyclical_scheduler.current_epoch,
@@ -271,6 +274,7 @@ class Runner:
                     # Update running moments for this cycle
                     with torch.no_grad():
                         theta_vec = nn.utils.parameters_to_vector(self.net.parameters())
+                        # self.all_samples[str(self.cyclical_scheduler.current_epoch) + '_' + str(batch_idx)] = theta_vec.clone()
                         
                         # Initialize or update cycle-specific moments
                         if cycle_number not in self.cycle_theta_mom1:
@@ -308,7 +312,7 @@ class Runner:
                         logger.info(f'Completed cycle {cycle_number}')
                         
                         # Calculate full batch likelihood for this cycle's model
-                        likelihood = np.array(self.full_batch_likelihoods(train_loader, num_samples=self.nst))
+                        likelihood = np.array(self.full_batch_likelihoods(train_loader))
                         
                         # Store the likelihood for this cycle
                         self.cycle_likelihoods[cycle_number] = likelihood
@@ -317,6 +321,7 @@ class Runner:
                         # Save parameter vector for this cycle
                         with torch.no_grad():
                             self.save_ckpt(epoch=self.cyclical_scheduler.current_epoch)
+                            # torch.save(self.all_samples, 'all_samples_TEST.ckpt')
         
         return loss/nb_samples, error/nb_samples, cycle_updated
 
@@ -493,44 +498,29 @@ class Runner:
 
         return ckpt['epoch']
     
-    def full_batch_likelihoods(self, train_loader, num_samples=10):
-        self.logger.info(f"Calculating full-batch likelihood for current cycle with {num_samples} samples...")
+    def full_batch_likelihoods(self, train_loader):
+        """
+        Calculate full-batch log-likelihood for the current model.
+        Returns the likelihood value (not negative log-likelihood).
+        """
+        self.logger.info("Calculating full-batch likelihood for current cycle...")
         self.net.eval()  # Set model to evaluation mode
-
-        # Load full batch from train_loader
-        all_x, all_y = [], []
-        for x, y in train_loader:
-            all_x.append(x)
-            all_y.append(y)
-        x_full = torch.cat(all_x).to(self.args.device)
-        y_full = torch.cat(all_y).to(self.args.device)
-
-        cycle = self.current_cycle
-        all_likelihoods = []
+        total_loss = 0.0
+        num_samples = 0
         
-        for _ in range(num_samples):
-            with torch.no_grad():
-                param_vars = copy.deepcopy(self.net)
-                param_means = copy.deepcopy(self.net)
-                net_sample = copy.deepcopy(self.net)
-
-                ratio = self.samples_per_cycle.get(cycle, 0) / (self.samples_per_cycle.get(cycle, 0) - 1)
-                cycle_variance = ratio * (self.cycle_theta_mom2[cycle] - self.cycle_theta_mom1[cycle]**2)
-                cycle_variance.clamp_(min=1e-12)
-                nn.utils.vector_to_parameters(cycle_variance, param_vars.parameters())
-                nn.utils.vector_to_parameters(self.cycle_theta_mom1[cycle], param_means.parameters())
-
-                for p, p_mean, p_var in zip(net_sample.parameters(), param_means.parameters(), param_vars.parameters()):
-                    eps = torch.randn_like(p)
-                    p.copy_(p_mean + p_var.sqrt() * eps)
-
-                # Single forward pass over the full batch
-                out = net_sample(x_full)
-                loss = self.criterion(out, y_full)
-                likelihood = np.exp(-loss.item())  # Convert full loss to likelihood
-                all_likelihoods.append(likelihood)
-
-        return all_likelihoods
+        with torch.no_grad():  # Disable gradient calculation
+            for x, y in tqdm(train_loader, desc="Likelihood calculation"):
+                x, y = x.to(self.args.device), y.to(self.args.device)
+                out = self.net(x)
+                loss = self.criterion(out, y)
+                total_loss += loss.item() * len(y)
+                num_samples += len(y)
+        
+        avg_loss = total_loss / num_samples
+        likelihood = np.exp(-avg_loss)  # Convert loss to likelihood
+        
+        self.logger.info(f"Full batch average loss: {avg_loss:.6f}, likelihood: {likelihood:.6e}")
+        return likelihood
 
     
     def calculate_gmm_weights(self):

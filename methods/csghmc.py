@@ -227,7 +227,7 @@ class Runner:
                     epoch=self.cyclical_scheduler.current_epoch,
                     batch=batch_idx,
                     batches_per_epoch=batches_per_epoch
-                ) and batch_idx % args.thin == 0
+                ) and batch_idx % self.thin == 0
                 
                 last_in_cycle = self.cyclical_scheduler.last_in_cycle(
                     epoch=self.cyclical_scheduler.current_epoch,
@@ -317,7 +317,7 @@ class Runner:
                         logger.info(f'Completed cycle {cycle_number}')
                         
                         # Calculate full batch likelihood for this cycle's model
-                        likelihood = np.array(self.full_batch_likelihoods(train_loader, num_samples=self.nst))
+                        likelihood = np.array(self.full_batch_likelihoods(train_loader))
                         
                         # Store the likelihood for this cycle
                         self.cycle_likelihoods[cycle_number] = likelihood
@@ -506,44 +506,29 @@ class Runner:
 
         return ckpt['epoch']
     
-    def full_batch_likelihoods(self, train_loader, num_samples=10):
-        self.logger.info(f"Calculating full-batch likelihood for current cycle with {num_samples} samples...")
+    def full_batch_likelihoods(self, train_loader):
+        """
+        Calculate full-batch log-likelihood for the current model.
+        Returns the likelihood value (not negative log-likelihood).
+        """
+        self.logger.info("Calculating full-batch likelihood for current cycle...")
         self.net.eval()  # Set model to evaluation mode
-
-        # Load full batch from train_loader
-        all_x, all_y = [], []
-        for x, y in train_loader:
-            all_x.append(x)
-            all_y.append(y)
-        x_full = torch.cat(all_x).to(self.args.device)
-        y_full = torch.cat(all_y).to(self.args.device)
-
-        cycle = self.current_cycle
-        all_likelihoods = []
+        total_loss = 0.0
+        num_samples = 0
         
-        for _ in range(num_samples):
-            with torch.no_grad():
-                param_vars = copy.deepcopy(self.net)
-                param_means = copy.deepcopy(self.net)
-                net_sample = copy.deepcopy(self.net)
-
-                ratio = self.samples_per_cycle.get(cycle, 0) / (self.samples_per_cycle.get(cycle, 0) - 1)
-                cycle_variance = ratio * (self.cycle_theta_mom2[cycle] - self.cycle_theta_mom1[cycle]**2)
-                cycle_variance.clamp_(min=1e-12)
-                nn.utils.vector_to_parameters(cycle_variance, param_vars.parameters())
-                nn.utils.vector_to_parameters(self.cycle_theta_mom1[cycle], param_means.parameters())
-
-                for p, p_mean, p_var in zip(net_sample.parameters(), param_means.parameters(), param_vars.parameters()):
-                    eps = torch.randn_like(p)
-                    p.copy_(p_mean + p_var.sqrt() * eps)
-
-                # Single forward pass over the full batch
-                out = net_sample(x_full)
-                loss = self.criterion(out, y_full)
-                likelihood = np.exp(-loss.item())  # Convert full loss to likelihood
-                all_likelihoods.append(likelihood)
-
-        return all_likelihoods
+        with torch.no_grad():  # Disable gradient calculation
+            for x, y in tqdm(train_loader, desc="Likelihood calculation"):
+                x, y = x.to(self.args.device), y.to(self.args.device)
+                out = self.net(x)
+                loss = self.criterion(out, y)
+                total_loss += loss.item() * len(y)
+                num_samples += len(y)
+        
+        avg_loss = total_loss / num_samples
+        likelihood = np.exp(-avg_loss)  # Convert loss to likelihood
+        
+        self.logger.info(f"Full batch average loss: {avg_loss:.6f}, likelihood: {likelihood:.6e}")
+        return likelihood
 
     
     def calculate_gmm_weights(self):
@@ -582,7 +567,6 @@ class Model(nn.Module):
 
     '''
     SGHMC sampler model.
-
     Actually no parameters involved.
     '''
 
@@ -622,14 +606,14 @@ class Model(nn.Module):
         Effects:
             net has .grad fields filled with SGHMC updates
         '''
-        
+
         bias = self.bias
         N = self.ND * Ninflate  # inflated training data size (accounting for data augmentation, etc.)
         if len(lrs) == 1:
             lr_body, lr_head = lrs[0], lrs[0]
         else:
             lr_body, lr_head = lrs[0], lrs[1]
-        
+
         # Initialize momentum if not already done
         if not hasattr(self, 'momentum_buffer'):
             self.momentum_buffer = {}
@@ -637,7 +621,7 @@ class Model(nn.Module):
                 self.momentum_buffer[name] = torch.zeros_like(param)
 
         # self.momentum_decay = momentum_decay
-        
+
         # Forward pass with theta
         out = net(x)
 
@@ -647,7 +631,7 @@ class Model(nn.Module):
         # Gradient d{loss_nll}/d{theta}
         net.zero_grad()
         loss.backward()
-        
+
         # Compute and set: 
         # v_t = (1-α)v_{t-1} - lr * grad_U(θ) + N(0, 2(α)lr)
         # where grad_U(θ) = -(1/N) * d{logp(th)}/d{th} + d{loss}/d{th}
@@ -658,29 +642,28 @@ class Model(nn.Module):
                         lr = lr_body
                     else:
                         lr = lr_head
-                    
+
                     # Get momentum for this parameter
                     v = self.momentum_buffer[pname]
-                    
+
                     # Compute gradient term including prior
                     if 'bias' in pname and bias == 'uninformative':
                         grad_U = p.grad  # Only data likelihood gradient
                     else:
                         grad_U = p.grad + (p - p0) / (self.prior_sig**2) / N  # Prior + likelihood gradient
-                    
-                    # Update momentum with friction and noise
-                    noise_scale = nd * np.sqrt(2 * self.momentum_decay * lr)
+
+                    # Noise term
+                    noise_scale = nd * np.sqrt(2 * self.momentum_decay / (N * lr))
                     noise = noise_scale * torch.randn_like(p)
-                    
+
                     # Update momentum (v) using SGHMC update rule
-                    # v.mul_(1 - self.momentum_decay).add_(-lr * grad_U + noise)
-                    v.mul_(1 - self.momentum_decay).add_(lr * grad_U + noise)
-                    
+                    v = v * (1 - self.momentum_decay) + lr * grad_U + noise
+
                     # Store updated momentum
                     self.momentum_buffer[pname] = v
-                    
-                    # Set gradient to be the momentum (for the optimizer update step)
-                    p.grad = v.clone()
-        
+
+                    # Update gradient using momentum
+                    p.grad = p.grad + v.clone()
+
         return loss.item(), out.detach()
 
