@@ -508,27 +508,59 @@ class Runner:
     
     def full_batch_likelihoods(self, train_loader):
         """
-        Calculate full-batch log-likelihood for the current model.
-        Returns the likelihood value (not negative log-likelihood).
+        Calculate full-batch log-likelihood for self.nst samples based on the current model.
+        Returns a list of likelihood values (not negative log-likelihood).
         """
-        self.logger.info("Calculating full-batch likelihood for current cycle...")
-        self.net.eval()  # Set model to evaluation mode
-        total_loss = 0.0
-        num_samples = 0
+        self.logger.info(f"Calculating full-batch likelihood for current cycle using {self.nst} samples...")
+        likelihoods = []
         
-        with torch.no_grad():  # Disable gradient calculation
-            for x, y in tqdm(train_loader, desc="Likelihood calculation"):
-                x, y = x.to(self.args.device), y.to(self.args.device)
-                out = self.net(x)
-                loss = self.criterion(out, y)
-                total_loss += loss.item() * len(y)
-                num_samples += len(y)
+        # Get current parameters as mean
+        with torch.no_grad():
+            param_mean = nn.utils.parameters_to_vector(self.net.parameters())
+            
+            # Calculate parameter variance based on current cycle's samples
+            cycle_variance = None
+            if self.current_cycle in self.cycle_theta_mom2 and self.current_cycle in self.cycle_theta_mom1:
+                n_samples = self.samples_per_cycle.get(self.current_cycle, 0)
+                if n_samples > 1:
+                    ratio = n_samples / (n_samples - 1)
+                    cycle_variance = ratio * (self.cycle_theta_mom2[self.current_cycle] - 
+                                            self.cycle_theta_mom1[self.current_cycle]**2)
+                    cycle_variance.clamp_(min=1e-12)  # Prevent negative variance
         
-        avg_loss = total_loss / num_samples
-        likelihood = np.exp(-avg_loss)  # Convert loss to likelihood
+        # If self.nst is 0, just use the mean parameters
+        samples_to_evaluate = max(1, self.nst)
         
-        self.logger.info(f"Full batch average loss: {avg_loss:.6f}, likelihood: {likelihood:.6e}")
-        return likelihood
+        for sample_idx in range(samples_to_evaluate):
+            # Create a copy of the network for this sample
+            net_sample = copy.deepcopy(self.net)
+            
+            # If using multiple samples, add Gaussian noise to parameters
+            if self.nst > 0 and cycle_variance is not None:
+                with torch.no_grad():
+                    eps = torch.randn_like(param_mean)
+                    param_sample = param_mean + cycle_variance.sqrt() * eps
+                    nn.utils.vector_to_parameters(param_sample, net_sample.parameters())
+            
+            net_sample.eval()  # Set model to evaluation mode
+            total_loss = 0.0
+            num_samples = 0
+            
+            with torch.no_grad():  # Disable gradient calculation
+                for x, y in tqdm(train_loader, desc=f"Likelihood calculation (sample {sample_idx+1}/{samples_to_evaluate})"):
+                    x, y = x.to(self.args.device), y.to(self.args.device)
+                    out = net_sample(x)
+                    loss = self.criterion(out, y)
+                    total_loss += loss.item() * len(y)
+                    num_samples += len(y)
+            
+            avg_loss = total_loss / num_samples
+            likelihood = np.exp(-avg_loss)  # Convert loss to likelihood
+            likelihoods.append(likelihood)
+            
+            self.logger.info(f"Sample {sample_idx+1} - Full batch average loss: {avg_loss:.6f}, likelihood: {likelihood:.6e}")
+        
+        return likelihoods
 
     
     def calculate_gmm_weights(self):
