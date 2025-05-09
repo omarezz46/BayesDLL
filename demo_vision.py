@@ -7,6 +7,7 @@ import json
 import numpy as np
 import torch
 import torch.nn.functional as F
+import wandb  # Add wandb import
 
 import networks
 import datasets
@@ -43,6 +44,13 @@ parser.add_argument('--momentum', type=float, default=0.5, help='momentum')
 parser.add_argument('--seed', type=int, default=42, help='random seed')
 parser.add_argument('--log_dir', type=str, default='results', help='root folder for saving logs')
 parser.add_argument('--test_eval_freq', type=int, default=1, help='do test evaluation (every this epochs)')
+
+# wandb arguments
+parser.add_argument('--use_wandb', action='store_true', help='use wandb for experiment tracking')
+parser.add_argument('--wandb_project', type=str, default='bayesdll', help='wandb project name')
+parser.add_argument('--wandb_entity', type=str, default=None, help='wandb entity/username')
+parser.add_argument('--wandb_tags', type=str, default='', help='comma-separated tags for wandb')
+parser.add_argument('--wandb_name', type=str, default=None, help='run name (defaults to timestamp-based)')
 
 args = parser.parse_args()
 
@@ -88,6 +96,54 @@ main_dir += f'seed{args.seed}_' + datetime.now().strftime('%Y_%m%d_%H%M%S')
 args.log_dir = os.path.join(args.log_dir, main_dir)
 utils.mkdir(args.log_dir)
 
+# Initialize wandb if requested
+if args.use_wandb:
+    # Set up wandb configuration
+    wandb_config = {
+        'method': args.method,
+        'dataset': args.dataset,
+        'backbone': args.backbone,
+        'val_heldout': args.val_heldout,
+        'pretrained': args.pretrained,
+        'batch_size': args.batch_size,
+        'lr': args.lr,
+        'lr_head': args.lr_head,
+        'momentum': args.momentum,
+        'epochs': args.epochs,
+        'seed': args.seed,
+        'num_cycles': args.num_cycles if hasattr(args, 'num_cycles') else 1,
+        'proportion_exploration': args.proportion_exploration if hasattr(args, 'proportion_exploration') else 0.5,
+        'device': str(args.device)
+    }
+    
+    # Add method-specific hyperparameters
+    for key, val in hparams.items():
+        wandb_config[f'hparam_{key}'] = val
+    
+    # Parse tags
+    tags = [tag.strip() for tag in args.wandb_tags.split(',') if tag.strip()]
+    
+    # Generate run name if not provided
+    run_name = args.wandb_name if args.wandb_name else main_dir.replace('/', '_')
+    
+    # Initialize wandb
+    wandb.init(
+        project=args.wandb_project,
+        entity=args.wandb_entity,
+        config=wandb_config,
+        name=run_name,
+        tags=tags,
+        dir=args.log_dir
+    )
+    
+    # Save command line for reproducibility
+    wandb.config.update({'command': " ".join(sys.argv)})
+    
+    # Make wandb accessible to runners
+    args.wandb = wandb
+else:
+    args.wandb = None
+
 # create logger
 logging.basicConfig(
     handlers=[
@@ -101,6 +157,8 @@ logging.basicConfig(
 logger = logging.getLogger()
 cmd = " ".join(sys.argv)
 logger.info(f"Command :: {cmd}\n")
+if args.use_wandb:
+    logger.info(f"WandB run: {wandb.run.name} (ID: {wandb.run.id})")
 
 # prepare data
 logger.info('Preparing data...')
@@ -112,6 +170,11 @@ net = networks.create_backbone(args)
 logger.info('Total params in the backbone: %.2fM' % (net.get_nb_parameters() / 1000000.0))
 logger.info('Backbone modules:\n%s' % (net.get_module_names()))
 
+# log model architecture to wandb
+if args.use_wandb:
+    wandb.config.update({'total_params_M': net.get_nb_parameters() / 1000000.0})
+    wandb.config.update({'model_architecture': net.get_module_names()})
+
 # load pretrained backbone (with zero'ed final prediction module)
 if args.pretrained is not None:
     logger.info('Load pretrained backbone network...')
@@ -121,54 +184,84 @@ else:
     logger.info('No pretrained backbone network provided.')
     net0 = None
 
-if args.method == 'vanilla':
-
-    from methods.vanilla import Runner
-
-    runner = Runner(net, net0, args, logger)
-    runner.train(train_loader, val_loader, test_loader)
-
-elif args.method == 'vi':
-
-    from methods.vi import Runner
-
-    runner = Runner(net, net0, args, logger)
-    runner.train(train_loader, val_loader, test_loader)
-
-elif args.method == 'mc_dropout':
-
-    from methods.mc_dropout import Runner
-
-    runner = Runner(net, net0, args, logger)
-    runner.train(train_loader, val_loader, test_loader)
-
-elif args.method == 'sgld':
-
-    from methods.sgld import Runner
-
-    runner = Runner(net, net0, args, logger)
-    runner.train(train_loader, val_loader, test_loader)
-
-elif args.method == 'la':
-
-    from methods.la import Runner
-
-    runner = Runner(net, net0, args, logger)
-    runner.train(train_loader, val_loader, test_loader)
-
-elif args.method == 'csgld':
-
-    from methods.csgld import Runner
-    runner = Runner(net, net0, args, logger)
-    runner.train(train_loader, val_loader, test_loader)
-
-elif args.method == 'adam_sghmc':
-    if __name__ == '__main__':
-        from methods.adam_sghmc import Runner
-
+try:
+    if args.method == 'vanilla':
+        from methods.vanilla import Runner
         runner = Runner(net, net0, args, logger)
-        runner.train(train_loader, val_loader, test_loader)
+        results = runner.train(train_loader, val_loader, test_loader)
 
-else:
-    raise NotImplementedError
+    elif args.method == 'vi':
+        from methods.vi import Runner
+        runner = Runner(net, net0, args, logger)
+        results = runner.train(train_loader, val_loader, test_loader)
 
+    elif args.method == 'mc_dropout':
+        from methods.mc_dropout import Runner
+        runner = Runner(net, net0, args, logger)
+        results = runner.train(train_loader, val_loader, test_loader)
+
+    elif args.method == 'sgld':
+        from methods.sgld import Runner
+        runner = Runner(net, net0, args, logger)
+        results = runner.train(train_loader, val_loader, test_loader)
+
+    elif args.method == 'la':
+        from methods.la import Runner
+        runner = Runner(net, net0, args, logger)
+        results = runner.train(train_loader, val_loader, test_loader)
+
+    elif args.method == 'csgld':
+        from methods.csgld import Runner
+        runner = Runner(net, net0, args, logger)
+        results = runner.train(train_loader, val_loader, test_loader)
+
+    elif args.method == 'csghmc':
+        from methods.csghmc import Runner
+        runner = Runner(net, net0, args, logger)
+        results = runner.train(train_loader, val_loader, test_loader)
+    
+    elif args.method == 'sghmc':
+        from methods.sghmc import Runner
+        runner = Runner(net, net0, args, logger)
+        results = runner.train(train_loader, val_loader, test_loader)
+
+    else:
+        raise NotImplementedError
+
+    # Log final results to wandb
+    if args.use_wandb and results:
+        # Log summary metrics
+        summary = {
+            'final_train_loss': float(results['losses_train'][-1]),
+            'final_train_error': float(results['errors_train'][-1]),
+            'final_test_loss': float(results['losses_test'][-1]),
+            'final_test_error': float(results['errors_test'][-1]),
+            'best_test_loss': float(min(results['losses_test'])),
+            'best_test_error': float(min(results['errors_test']))
+        }
+        
+        if results['losses_val'] is not None:
+            summary.update({
+                'final_val_loss': float(results['losses_val'][-1]),
+                'final_val_error': float(results['errors_val'][-1]),
+                'best_val_loss': float(min(results['losses_val'])),
+                'best_val_error': float(min(results['errors_val']))
+            })
+            
+        wandb.summary.update(summary)
+        
+        # # Log final artifacts
+        # model_artifact = wandb.Artifact(f"{wandb.run.name}-model", type="model")
+        # model_artifact.add_dir(args.log_dir)
+        # wandb.log_artifact(model_artifact)
+
+except Exception as e:
+    logger.exception(f"Training failed with error: {e}")
+    if args.use_wandb:
+        wandb.finish(exit_code=1)
+    raise
+
+finally:
+    # Properly finish wandb run
+    if args.use_wandb:
+        wandb.finish()
