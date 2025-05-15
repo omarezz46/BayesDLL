@@ -57,8 +57,7 @@ class Runner:
         )
 
         # TODO: create scheduler?
-        self.scheduler = torch.optim.lr_scheduler.StepLR(self.optimizer, step_size=5, gamma=0.5)
-
+       
         self.criterion = torch.nn.CrossEntropyLoss()
 
         self.Ninflate = float(hparams['Ninflate'])  # N inflation factor (factor in data augmentation)
@@ -107,12 +106,12 @@ class Runner:
             losses_train[ep], errors_train[ep], bi = self.train_one_epoch(
                 train_loader, collect=(ep>=self.burnin), bi=bi
             )
-            self.scheduler.step()  # update learning rate
+            
             toc = time.time()
 
             prn_str = '[Epoch %d/%d] Training summary: ' % (ep, args.epochs)
             prn_str += 'loss = %.4f, prediction error = %.4f ' % (losses_train[ep], errors_train[ep])
-            prn_str += 'lr = %.4f ' % self.scheduler.get_lr()[0]
+            # prn_str += 'lr = %.5f ' % self.scheduler.get_last_lr()[0]
             prn_str += '(time: %.4f seconds)' % (toc-tic,)
             logger.info(prn_str)
 
@@ -379,6 +378,7 @@ class Runner:
                 'post_theta_cnt': self.post_theta_cnt, 
                 'prior_sig': self.model.prior_sig, 
                 'optimizer': self.optimizer.state_dict(),
+                'momentum_buffer': self.model.momentum_buffer,  # Save SGHMC momentum state
                 'epoch': epoch, 
             },
             fname
@@ -396,6 +396,10 @@ class Runner:
             self.post_theta_mom2 = ckpt['post_theta_mom2']
         self.post_theta_cnt = ckpt['epoch']
         self.model.prior_sig = ckpt['prior_sig']
+
+        if 'momentum_buffer' in ckpt:
+            self.model.momentum_buffer = ckpt['momentum_buffer']  # Load SGHMC momentum state
+
         self.optimizer.load_state_dict(ckpt['optimizer'])
 
         return ckpt['epoch']
@@ -491,19 +495,17 @@ class Model(nn.Module):
                     else:
                         grad_U = p.grad + (p - p0) / (self.prior_sig**2) / N  # Prior + likelihood gradient
                     
-                    # Update momentum with friction and noise
-                    noise_scale = nd * np.sqrt(2 * self.momentum_decay * lr)
+                    # Noise term
+                    noise_scale = nd * np.sqrt(2 * self.momentum_decay / (N * lr))
                     noise = noise_scale * torch.randn_like(p)
                     
                     # Update momentum (v) using SGHMC update rule
-                    # v.mul_(1 - self.momentum_decay).add_(-lr * grad_U + noise)
-                    v.mul_(1 - self.momentum_decay).add_(lr * grad_U + noise)
+                    v = v * (1 - self.momentum_decay) + lr * grad_U + noise
                     
                     # Store updated momentum
                     self.momentum_buffer[pname] = v
                     
-                    # Set gradient to be the momentum (for the optimizer update step)
-                    p.grad = v.clone()
+                    # Update gradient using momentum
+                    p.grad = p.grad + v.clone()
         
         return loss.item(), out.detach()
-

@@ -599,6 +599,7 @@ class Model(nn.Module):
 
     '''
     SGHMC sampler model.
+
     Actually no parameters involved.
     '''
 
@@ -638,14 +639,14 @@ class Model(nn.Module):
         Effects:
             net has .grad fields filled with SGHMC updates
         '''
-
+        
         bias = self.bias
         N = self.ND * Ninflate  # inflated training data size (accounting for data augmentation, etc.)
         if len(lrs) == 1:
             lr_body, lr_head = lrs[0], lrs[0]
         else:
             lr_body, lr_head = lrs[0], lrs[1]
-
+        
         # Initialize momentum if not already done
         if not hasattr(self, 'momentum_buffer'):
             self.momentum_buffer = {}
@@ -653,7 +654,7 @@ class Model(nn.Module):
                 self.momentum_buffer[name] = torch.zeros_like(param)
 
         # self.momentum_decay = momentum_decay
-
+        
         # Forward pass with theta
         out = net(x)
 
@@ -663,7 +664,7 @@ class Model(nn.Module):
         # Gradient d{loss_nll}/d{theta}
         net.zero_grad()
         loss.backward()
-
+        
         # Compute and set: 
         # v_t = (1-α)v_{t-1} - lr * grad_U(θ) + N(0, 2(α)lr)
         # where grad_U(θ) = -(1/N) * d{logp(th)}/d{th} + d{loss}/d{th}
@@ -674,28 +675,28 @@ class Model(nn.Module):
                         lr = lr_body
                     else:
                         lr = lr_head
-
+                    
                     # Get momentum for this parameter
                     v = self.momentum_buffer[pname]
-
+                    
                     # Compute gradient term including prior
                     if 'bias' in pname and bias == 'uninformative':
                         grad_U = p.grad  # Only data likelihood gradient
                     else:
                         grad_U = p.grad + (p - p0) / (self.prior_sig**2) / N  # Prior + likelihood gradient
-
+                    
                     # Noise term
                     noise_scale = nd * np.sqrt(2 * self.momentum_decay / (N * lr))
                     noise = noise_scale * torch.randn_like(p)
-
+                    
                     # Update momentum (v) using SGHMC update rule
                     v = v * (1 - self.momentum_decay) + lr * grad_U + noise
-
+                    
                     # Store updated momentum
                     self.momentum_buffer[pname] = v
-
+                    
                     # Update gradient using momentum
                     p.grad = p.grad + v.clone()
-
+        
         return loss.item(), out.detach()
 
