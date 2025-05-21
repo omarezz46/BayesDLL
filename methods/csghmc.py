@@ -90,7 +90,7 @@ class Runner:
         args = self.args
         logger = self.logger
 
-        logger.info('Start training with Cyclical SGLD...')
+        logger.info('Start training with Cyclical SGHMC...')
 
         losses_train = np.zeros(args.epochs)
         errors_train = np.zeros(args.epochs)
@@ -480,6 +480,7 @@ class Runner:
                 'cycle_theta_mom1': self.cycle_theta_mom1,
                 'cycle_theta_mom2': self.cycle_theta_mom2,
                 'cycle_likelihoods': self.cycle_likelihoods,
+                'cycle_states': self.cycle_states,
                 # 'prior_sig': self.model.prior_sig, 
                 # 'optimizer': self.optimizer.state_dict(),
                 'epoch': epoch,

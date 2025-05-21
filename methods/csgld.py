@@ -471,10 +471,12 @@ class Runner:
         fname = os.path.join(self.args.log_dir, f"{self.current_cycle}_ckpt.pt")
 
         torch.save(
-            {   'last_theta': self.net.state_dict(),
+            {   
+                'last_theta': self.net.state_dict(),
                 'cycle_theta_mom1': self.cycle_theta_mom1,
                 'cycle_theta_mom2': self.cycle_theta_mom2,
                 'cycle_likelihoods': self.cycle_likelihoods,
+                'cycle_states': self.cycle_states,
                 # 'prior_sig': self.model.prior_sig, 
                 # 'optimizer': self.optimizer.state_dict(),
                 'epoch': epoch,
