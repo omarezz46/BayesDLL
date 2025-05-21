@@ -54,7 +54,7 @@ class Runner:
         self.optimizer = torch.optim.SGD(
             [{'params': [p for pn, p in self.net.named_parameters() if self.net.readout_name not in pn], 'lr': args.lr},
              {'params': [p for pn, p in self.net.named_parameters() if self.net.readout_name in pn], 'lr': args.lr_head}],
-            momentum = args.momentum, weight_decay = 0
+            momentum = 0, weight_decay = 0
         )
 
         self.cyclical_scheduler = CyclicalSGMCMC(
@@ -80,6 +80,7 @@ class Runner:
         self.cycle_theta_mom1 = {}  # Stores mean parameter vector for each cycle
         self.cycle_theta_mom2 = {}   # Stores variance parameter vector for each cycle
         self.cycle_likelihoods = {}  # Stores likelihoods for each sample in each cycle
+        self.cycle_states = {}  # Stores the state of the model for each cycle
 
 
     def train(self, train_loader, val_loader, test_loader):
@@ -311,6 +312,8 @@ class Runner:
                         batches_per_epoch=batches_per_epoch
                     )
                     
+                    self.cycle_states[cycle_number] = copy.deepcopy(self.net.state_dict())
+
                     if cycle_number > self.current_cycle:
                         cycle_updated = True
                         self.current_cycle = cycle_number

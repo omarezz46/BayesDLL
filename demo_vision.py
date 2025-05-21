@@ -33,6 +33,7 @@ parser.add_argument('--ece_num_bins', type=int, default=15, help='number of bins
 # cyclical specific params
 parser.add_argument('--num_cycles', type=int, default=1, help='number of cycles')
 parser.add_argument('--proportion_exploration', type=float, default=0.5, help='proportion of exploration phase in each cycle')
+parser.add_argument('--full_sample', type=bool, default=False, help='full sample in the exploration phase')
 
 # other optim hparams
 parser.add_argument('--epochs', type=int, default=100, help='number of training epochs')

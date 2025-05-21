@@ -74,8 +74,9 @@ class Runner:
         self.cycle_theta_mom1 = {}  # Stores mean parameter vector for each cycle
         self.cycle_theta_mom2 = {}   # Stores variance parameter vector for each cycle
         self.cycle_likelihoods = {}  # Stores likelihoods for each sample in each cycle
+        self.cycle_states = {}
 
-        # self.all_samples = {}  # Stores all samples collected so far
+        self.all_samples = {}  # Stores all samples collected so far
 
     def train(self, train_loader, val_loader, test_loader):
         '''
@@ -274,7 +275,8 @@ class Runner:
                     # Update running moments for this cycle
                     with torch.no_grad():
                         theta_vec = nn.utils.parameters_to_vector(self.net.parameters())
-                        # self.all_samples[str(self.cyclical_scheduler.current_epoch) + '_' + str(batch_idx)] = theta_vec.clone()
+                        if args.full_sample:    
+                            self.all_samples[str(self.cyclical_scheduler.current_epoch) + '_' + str(batch_idx)] = theta_vec.clone()
                         
                         # Initialize or update cycle-specific moments
                         if cycle_number not in self.cycle_theta_mom1:
@@ -306,6 +308,8 @@ class Runner:
                         batches_per_epoch=batches_per_epoch
                     )
                     
+                    self.cycle_states[cycle_number] = copy.deepcopy(self.net.state_dict())
+
                     if cycle_number > self.current_cycle:
                         cycle_updated = True
                         self.current_cycle = cycle_number
@@ -321,7 +325,8 @@ class Runner:
                         # Save parameter vector for this cycle
                         with torch.no_grad():
                             self.save_ckpt(epoch=self.cyclical_scheduler.current_epoch)
-                            # torch.save(self.all_samples, 'all_samples_TEST.ckpt')
+                            if args.full_sample:
+                                torch.save(self.all_samples, 'all_samples_TEST.ckpt')
         
         return loss/nb_samples, error/nb_samples, cycle_updated
 
@@ -466,7 +471,7 @@ class Runner:
         fname = os.path.join(self.args.log_dir, f"{self.current_cycle}_ckpt.pt")
 
         torch.save(
-            {   'last_theta': nn.utils.parameters_to_vector(self.net.parameters()),
+            {   'last_theta': self.net.state_dict(),
                 'cycle_theta_mom1': self.cycle_theta_mom1,
                 'cycle_theta_mom2': self.cycle_theta_mom2,
                 'cycle_likelihoods': self.cycle_likelihoods,

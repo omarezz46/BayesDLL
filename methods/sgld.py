@@ -369,7 +369,8 @@ class Runner:
         fname = os.path.join(self.args.log_dir, f"ckpt.pt")
 
         torch.save(
-            {
+            {   
+                'last_theta': self.net.state_dict(),  # current theta
                 'post_theta_mom1': self.post_theta_mom1,  
                 'post_theta_mom2': self.post_theta_mom2 if self.nst>0 else None, 
                 'post_theta_cnt': self.post_theta_cnt, 
