@@ -37,20 +37,37 @@ class Runner:
             self.net0 = net0
         self.net0 = self.net0.to(args.device)
 
-        # workhorse network (current SGHMC sample is maintained in here)
+        # workhorse network (current Adam-SGHMC sample is maintained in here)
         self.net = net.to(args.device)
 
-        # create Hamiltonian mcmc model (nn.Module with actually no parameters)
+        # create Adam Hamiltonian mcmc model (nn.Module with actually no parameters)
         hparams = args.hparams
+                # Add temperature parameter
+        self.temperature = float(hparams.get('temperature', 1.0))
+
+        self.perform_cold_restarts = str(hparams.get('perform_cold_restarts', False)).lower() == 'true'
+        if self.perform_cold_restarts:
+            self.logger.info("Performing cold restarts: re-initializing network parameters with fresh random weights at the start of each cycle.")
+        else:
+            self.logger.info("Cold restarts disabled: keeping network parameters across cycles.")
+        
         self.model = Model(
-            ND=args.ND, prior_sig=float(hparams['prior_sig']), bias=str(hparams['bias']), momentum_decay=float(hparams['momentum_decay'])
+            ND=args.ND, prior_sig=float(hparams['prior_sig']), 
+            bias=str(hparams['bias']), 
+            momentum_decay=float(hparams['momentum_decay']),
+            beta1=float(hparams.get('beta1', 0.9)),
+            beta2=float(hparams.get('beta2', 0.999)),
+            epsilon=float(hparams.get('epsilon', 1e-8)),
+            temperature=self.temperature  # Pass temperature to model
         ).to(args.device)
+
 
         # create optimizer (for workhorse network -- to update SGHMC sample)
         # self.optimizer = torch.optim.SGD(
         #     self.net.parameters(), 
         #     lr = args.lr, momentum = args.momentum, weight_decay = 0
         # )
+        # Force SGD optimizer momentum to 0, since momentum is handled in Adam-SGHMC
         self.optimizer = torch.optim.SGD(
             [{'params': [p for pn, p in self.net.named_parameters() if self.net.readout_name not in pn], 'lr': args.lr},
              {'params': [p for pn, p in self.net.named_parameters() if self.net.readout_name in pn], 'lr': args.lr_head}],
@@ -82,6 +99,48 @@ class Runner:
         self.cycle_likelihoods = {}  # Stores likelihoods for each sample in each cycle
         self.cycle_states = {}  # Stores the state of the model for each cycle
 
+    def _reinitialize_network_fresh(self):
+        """
+        Re-initializes the network parameters with fresh random weights.
+        Uses standard PyTorch initialization schemes for different layer types.
+        """
+        def fresh_weight_init(m):
+            if isinstance(m, nn.Linear):
+                # Xavier/Glorot initialization for linear layers
+                nn.init.xavier_uniform_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, nn.Conv2d):
+                # Kaiming initialization for conv layers (good for ReLU)
+                nn.init.kaiming_uniform_(m.weight, mode='fan_in', nonlinearity='relu')
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif isinstance(m, (nn.BatchNorm2d, nn.BatchNorm1d)):
+                # Standard initialization for batch norm
+                if m.weight is not None:
+                    nn.init.ones_(m.weight)
+                if m.bias is not None:
+                    nn.init.zeros_(m.bias)
+            elif hasattr(m, 'reset_parameters'):
+                # Fallback to module's own reset_parameters if available
+                m.reset_parameters()
+
+        self.net.apply(fresh_weight_init)
+        self.logger.info("Network parameters re-initialized with fresh random weights for cold restart.")
+
+    def _reset_optimizer_states(self):
+        """
+        Reset all Adam-SGHMC optimizer states (momentum, m, v, t).
+        """
+        if hasattr(self.model, 'momentum_buffer'):
+            for name in self.model.momentum_buffer:
+                self.model.momentum_buffer[name].zero_()
+                if hasattr(self.model, 'm') and name in self.model.m:
+                    self.model.m[name].zero_()
+                if hasattr(self.model, 'v') and name in self.model.v:
+                    self.model.v[name].zero_()
+        self.model.t = 0  # Reset Adam time step
+        self.logger.info("All optimizer states (momentum, m, v, t) reset for new cycle.")
 
     def train(self, train_loader, val_loader, test_loader):
         '''
@@ -123,6 +182,10 @@ class Runner:
                     tic = time.time()
                     losses_val[ep], errors_val[ep], targets_val, logits_val, logits_all_val = \
                         self.evaluate(val_loader)
+                    #evaluate point estimation on validation set
+                    point_loss, point_error = self.evaluate_simple(val_loader)
+                    #evaluate cycle theta_mom1 on validation set
+                    logger.info(f'Point estimation on validation set: loss = {point_loss:.4f}, error = {point_error:.4f}')
                     toc = time.time()
                     prn_str = f'(Epoch {ep}) Validation summary: '
                     prn_str += f'loss = {losses_val[ep]:.4f}, prediction error = {errors_val[ep]:.4f} '
@@ -306,6 +369,14 @@ class Runner:
                                     # Handle end of cycle
                 if last_in_cycle:
                     # Get current cycle number
+                    self.logger.info(f'Resetting momentum states for new cycle {cycle_number}')
+                    if hasattr(self.model, 'momentum_buffer'):
+                        for name in self.model.momentum_buffer:
+                            self.model.momentum_buffer[name].zero_()
+                            self.model.m[name].zero_()
+                            self.model.v[name].zero_()
+                    self.model.t = 0  # Reset Adam time step
+                
                     cycle_number = self.cyclical_scheduler.get_cycle_number(
                         epoch=self.cyclical_scheduler.current_epoch,
                         batch=batch_idx,
@@ -329,6 +400,17 @@ class Runner:
                         # Save parameter vector for this cycle
                         with torch.no_grad():
                             self.save_ckpt(epoch=self.cyclical_scheduler.current_epoch)
+                        
+                        # Prepare for next cycle - always reset optimizer states
+                        self._reset_optimizer_states()
+                    
+                        # Optionally perform cold restart (fresh random weights)
+                        if self.perform_cold_restarts and cycle_number >= 1:  # Don't restart after cycle 0
+                            logger.info(f'Performing COLD RESTART: Fresh random weight initialization for cycle {cycle_number + 1}')
+                            self._reinitialize_network_fresh()
+                            # Optimizer states are already reset above
+                        else:
+                            logger.info(f'Standard cycle transition: keeping weights, optimizer states reset for cycle {cycle_number + 1}')
         
         return loss/nb_samples, error/nb_samples, cycle_updated
 
@@ -411,6 +493,7 @@ class Runner:
                                 for p, p_mean, p_var in zip(net_sample.parameters(), param_means.parameters(), param_vars.parameters()):
                                     eps = torch.randn_like(p)
                                     p.copy_(p_mean + p_var.sqrt() * eps)  # Now shapes match
+                                    # p.copy_(p_mean)
                                     
                                 out = net_sample(x)
                             component_logits.append(out)
@@ -457,6 +540,39 @@ class Runner:
         logits_all = np.concatenate(logits_all, axis=0)
         
         return loss/nb_samples, error/nb_samples, targets, logits, logits_all
+
+    def evaluate_simple(self, test_loader):
+        """
+        Simple evaluation using current network state (before burn-in period).
+        No Bayesian averaging, just deterministic forward pass.
+        """
+        args = self.args
+        
+        self.net.eval()
+        
+        loss, error, nb_samples = 0, 0, 0
+        with torch.no_grad():
+            with tqdm(test_loader, unit="batch", desc="Val") as tepoch:
+                for x, y in tepoch:
+                    x, y = x.to(args.device), y.to(args.device)
+                    
+                    # Simple forward pass with current network
+                    logits_ = self.net(x)
+                    loss_ = self.criterion(logits_, y)
+                    
+                    # Predictions
+                    pred = logits_.data.max(dim=1)[1]
+                    err = pred.ne(y.data).sum()
+                    
+                    loss += loss_.item() * len(y)
+                    error += err.item()
+                    nb_samples += len(y)
+                    
+                    tepoch.set_postfix(loss=loss/nb_samples, error=error/nb_samples)
+        
+        self.net.train()  # Switch back to training mode
+        
+        return loss/nb_samples, error/nb_samples
 
     def save_logits(self, targets, logits, logits_all, suffix=None):
 
@@ -614,12 +730,12 @@ class Runner:
 class Model(nn.Module):
 
     '''
-    SGHMC sampler model.
+    Adam-SGHMC sampler model.
 
     Actually no parameters involved.
     '''
 
-    def __init__(self, ND, prior_sig=1.0, bias='informative', momentum_decay=0.05):
+    def __init__(self, ND, prior_sig=1.0, bias='informative', momentum_decay=0.05, beta1=0.9, beta2=0.999, epsilon=1e-8, temperature=1.0):
 
         '''
         Args:
@@ -628,6 +744,10 @@ class Model(nn.Module):
             bias = how to treat bias parameters:
                 "informative": -- the same treatment as weights
                 "uninformative": uninformative bias prior
+            momentum_decay = momentum decay parameter (alpha in SGHMC papers)
+            beta1 = Adam beta1 parameter (exponential decay rate for first moment)
+            beta2 = Adam beta2 parameter (exponential decay rate for second moment)
+            epsilon = small constant for numerical stability
         '''
 
         super().__init__()
@@ -636,24 +756,28 @@ class Model(nn.Module):
         self.prior_sig = prior_sig
         self.bias = bias
         self.momentum_decay = momentum_decay
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.epsilon = epsilon
+        self.temperature = temperature  # Temperature parameter for scaling
+        self.t = 0  # Initialize time step counter
 
     def forward(self, x, y, net, net0, criterion, lrs, Ninflate=1.0, nd=1.0):
         '''
-        Evaluate minibatch SGHMC updates for a given batch.
+        Evaluate minibatch Adam-SGHMC updates for a given batch.
         Args:
             x, y = batch input, output
             net = workhorse network (its parameters will be filled in)
             net0 = prior mean parameters
             criterion = loss function
             lrs = learning rates in list (adjusted to "eta" in SGHMC)
-            momentum_decay = momentum decay parameter (referred to as α in SGHMC papers)
             Ninflate = inflate N by this order of magnitude
             nd = noise discount factor
         Returns:
             loss = NLL loss on the batch
             out = class prediction on the batch
         Effects:
-            net has .grad fields filled with SGHMC updates
+            net has .grad fields filled with Adam-SGHMC updates
         '''
         
         bias = self.bias
@@ -663,13 +787,18 @@ class Model(nn.Module):
         else:
             lr_body, lr_head = lrs[0], lrs[1]
         
-        # Initialize momentum if not already done
+        # Initialize Adam moment estimates and momentum if not already done
         if not hasattr(self, 'momentum_buffer'):
             self.momentum_buffer = {}
+            self.m = {}  # First moment estimate
+            self.v = {}  # Second moment estimate
             for name, param in net.named_parameters():
                 self.momentum_buffer[name] = torch.zeros_like(param)
-
-        # self.momentum_decay = momentum_decay
+                self.m[name] = torch.zeros_like(param)
+                self.v[name] = torch.zeros_like(param)
+        
+        # Increment time step
+        self.t += 1
         
         # Forward pass with theta
         out = net(x)
@@ -681,9 +810,7 @@ class Model(nn.Module):
         net.zero_grad()
         loss.backward()
         
-        # Compute and set: 
-        # v_t = (1-α)v_{t-1} - lr * grad_U(θ) + N(0, 2(α)lr)
-        # where grad_U(θ) = -(1/N) * d{logp(th)}/d{th} + d{loss}/d{th}
+        # Compute and set Adam-SGHMC updates
         with torch.no_grad():
             for (pname, p), p0 in zip(net.named_parameters(), net0.parameters()):
                 if p.grad is not None:
@@ -692,27 +819,45 @@ class Model(nn.Module):
                     else:
                         lr = lr_head
                     
-                    # Get momentum for this parameter
-                    v = self.momentum_buffer[pname]
+                    # Get momentum and moment estimates for this parameter
+                    v_momentum = self.momentum_buffer[pname]
+                    m = self.m[pname]
+                    v = self.v[pname]
                     
                     # Compute gradient term including prior
                     if 'bias' in pname and bias == 'uninformative':
-                        grad_U = p.grad  # Only data likelihood gradient
+                        grad_U = p.grad / self.temperature # Only data likelihood gradient
                     else:
-                        grad_U = p.grad + (p - p0) / (self.prior_sig**2) / N  # Prior + likelihood gradient
+                        grad_U = ( p.grad / self.temperature ) + (p - p0) / (self.prior_sig**2) / N  # Prior + likelihood gradient
                     
-                    # Noise term
-                    noise_scale = nd * np.sqrt(2 * self.momentum_decay / (N * lr))
+                    # Update biased first moment estimate (Adam)
+                    m = self.beta1 * m + (1 - self.beta1) * grad_U
+                    
+                    # Update biased second moment estimate (Adam)
+                    v = self.beta2 * v + (1 - self.beta2) * (grad_U * grad_U)
+                    
+                    # Compute bias-corrected first and second moment estimates
+                    m_hat = m / (1 - self.beta1 ** self.t)
+                    v_hat = v / (1 - self.beta2 ** self.t)
+                    
+                    # Compute preconditioned gradient
+                    precond_grad = m_hat / (torch.sqrt(v_hat) + self.epsilon)
+                    
+                    # Noise term for SGHMC with preconditioning
+                    precond_term = 1.0 / (torch.sqrt(v_hat) + self.epsilon)
+                    noise_scale = nd * torch.sqrt(2 * self.momentum_decay * precond_term / N )
                     noise = noise_scale * torch.randn_like(p)
                     
-                    # Update momentum (v) using SGHMC update rule
-                    v = v * (1 - self.momentum_decay) + lr * grad_U + noise
+                    # Update momentum (v) using Adam-SGHMC update rule
+                    v_momentum = v_momentum * (1 - self.momentum_decay) + lr * precond_grad + noise
                     
-                    # Store updated momentum
-                    self.momentum_buffer[pname] = v
+                    # Store updated momentum and moment estimates
+                    self.momentum_buffer[pname] = v_momentum
+                    self.m[pname] = m
+                    self.v[pname] = v
                     
                     # Update gradient using momentum
-                    p.grad = v.clone()
+                    # p.grad = p.grad + v_momentum.clone()
+                    p.grad = v_momentum.clone()
         
         return loss.item(), out.detach()
-

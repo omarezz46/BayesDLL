@@ -225,7 +225,16 @@ try:
         from methods.sghmc import Runner
         runner = Runner(net, net0, args, logger)
         results = runner.train(train_loader, val_loader, test_loader)
+    
+    elif args.method == 'adam_sghmc':
+        from methods.adam_sghmc import Runner
+        runner = Runner(net, net0, args, logger)
+        results = runner.train(train_loader, val_loader, test_loader)
 
+    elif args.method == 'adam_csghmc':
+        from methods.adam_csghmc import Runner
+        runner = Runner(net, net0, args, logger)
+        results = runner.train(train_loader, val_loader, test_loader)
     else:
         raise NotImplementedError
 
