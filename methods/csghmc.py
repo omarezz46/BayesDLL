@@ -43,7 +43,7 @@ class Runner:
         # create Hamiltonian mcmc model (nn.Module with actually no parameters)
         hparams = args.hparams
         self.model = Model(
-            ND=args.ND, prior_sig=float(hparams['prior_sig']), bias=str(hparams['bias']), momentum_decay=float(hparams['momentum_decay'])
+            ND=args.ND, prior_sig=float(hparams['prior_sig']), runner=self, bias=str(hparams['bias']), momentum_decay=float(hparams['momentum_decay'])
         ).to(args.device)
 
         # create optimizer (for workhorse network -- to update SGHMC sample)
@@ -251,7 +251,7 @@ class Runner:
                 loss_, out = self.model(
                     x, y, self.net, self.net0, self.criterion, 
                     [pg['lr'] for pg in self.optimizer.param_groups],
-                    self.Ninflate, self.nd
+                    self.Ninflate, self.nd, should_sample=should_sample
                 )
                 if hasattr(args, 'clip_grad') and args.clip_grad is not None:
                     torch.nn.utils.clip_grad_norm_(self.net.parameters(), args.clip_grad)
@@ -282,16 +282,22 @@ class Runner:
                     with torch.no_grad():
                         theta_vec = nn.utils.parameters_to_vector(self.net.parameters())
                         
-                        # Initialize or update cycle-specific moments
+                        # In train_one_epoch method, replace the moment update section around line 300:
+
+                        # Update running moments for this cycle using Welford's algorithm
                         if cycle_number not in self.cycle_theta_mom1:
+                            # First sample - initialize
                             self.cycle_theta_mom1[cycle_number] = theta_vec.clone()
-                            self.cycle_theta_mom2[cycle_number] = theta_vec**2
+                            self.cycle_theta_mom2[cycle_number] = torch.zeros_like(theta_vec)  # This will store sum of squared deviations
+                            self.samples_per_cycle[cycle_number] = 1
                         else:
-                            cycle_count = self.samples_per_cycle.get(cycle_number, 0) + 1
-                            self.cycle_theta_mom1[cycle_number] = (theta_vec + 
-                                (cycle_count-1) * self.cycle_theta_mom1[cycle_number]) / cycle_count
-                            self.cycle_theta_mom2[cycle_number] = (theta_vec**2 + 
-                                    (cycle_count-1) * self.cycle_theta_mom2[cycle_number]) / cycle_count
+                            # Update using Welford's algorithm
+                            n = self.samples_per_cycle.get(cycle_number, 0) + 1
+                            delta = theta_vec - self.cycle_theta_mom1[cycle_number]
+                            self.cycle_theta_mom1[cycle_number] += delta / n
+                            delta2 = theta_vec - self.cycle_theta_mom1[cycle_number]
+                            self.cycle_theta_mom2[cycle_number] += delta * delta2
+                            self.samples_per_cycle[cycle_number] = n
                     
                     self.samples_collected += 1
                     self.samples_per_cycle[cycle_number] = self.samples_per_cycle.get(cycle_number, 0) + 1
@@ -395,12 +401,16 @@ class Runner:
                         param_vars = copy.deepcopy(net_c)
                         param_means = copy.deepcopy(net_c)
                         with torch.no_grad():
+                            # In evaluate method, replace variance calculation:
+
                             if cycle in self.cycle_theta_mom2:
-                                ratio = self.samples_per_cycle.get(cycle, 0) / (self.samples_per_cycle.get(cycle, 0) - 1)
-                                if self.samples_per_cycle.get(cycle, 0) > 1:
-                                    cycle_variance = ratio * (self.cycle_theta_mom2[cycle] - self.cycle_theta_mom1[cycle]**2)
+                                n_samples = self.samples_per_cycle.get(cycle, 0)
+                                if n_samples > 1:
+                                    # Use Welford's variance: Var = M2 / (n-1)
+                                    cycle_variance = self.cycle_theta_mom2[cycle] / (n_samples - 1)
                                 else:
-                                    cycle_variance = self.cycle_theta_mom2[cycle] - self.cycle_theta_mom1[cycle]**2
+                                    # Single sample - use small variance
+                                    cycle_variance = torch.ones_like(self.cycle_theta_mom1[cycle]) * 1e-12
                                 cycle_variance.clamp_(min=1e-12)
                                 nn.utils.vector_to_parameters(cycle_variance, param_vars.parameters())
                                 nn.utils.vector_to_parameters(self.cycle_theta_mom1[cycle], param_means.parameters())
@@ -523,13 +533,17 @@ class Runner:
             param_mean = self.cycle_theta_mom1[self.current_cycle] 
             # Calculate parameter variance based on current cycle's samples
             cycle_variance = None
-            if self.current_cycle in self.cycle_theta_mom2 and self.current_cycle in self.cycle_theta_mom1:
-                n_samples = self.samples_per_cycle.get(self.current_cycle, 0)
+            # In evaluate method, replace variance calculation:
+            cycle = self.current_cycle
+            if cycle in self.cycle_theta_mom2:
+                n_samples = self.samples_per_cycle.get(cycle, 0)
                 if n_samples > 1:
-                    ratio = n_samples / (n_samples - 1)
-                    cycle_variance = ratio * (self.cycle_theta_mom2[self.current_cycle] - 
-                                            self.cycle_theta_mom1[self.current_cycle]**2)
-                    cycle_variance.clamp_(min=1e-12)  # Prevent negative variance
+                    # Use Welford's variance: Var = M2 / (n-1)
+                    cycle_variance = self.cycle_theta_mom2[cycle] / (n_samples - 1)
+                else:
+                    # Single sample - use small variance
+                    cycle_variance = torch.ones_like(self.cycle_theta_mom1[cycle]) * 1e-12
+                cycle_variance.clamp_(min=1e-12)
         
         # If self.nst is 0, just use the mean parameters
         samples_to_evaluate = max(1, self.nst)
@@ -619,7 +633,7 @@ class Model(nn.Module):
     Actually no parameters involved.
     '''
 
-    def __init__(self, ND, prior_sig=1.0, bias='informative', momentum_decay=0.05):
+    def __init__(self, ND, runner, prior_sig=1.0, bias='informative', momentum_decay=0.05):
 
         '''
         Args:
@@ -636,8 +650,9 @@ class Model(nn.Module):
         self.prior_sig = prior_sig
         self.bias = bias
         self.momentum_decay = momentum_decay
+        self.runner = runner
 
-    def forward(self, x, y, net, net0, criterion, lrs, Ninflate=1.0, nd=1.0):
+    def forward(self, x, y, net, net0, criterion, lrs, Ninflate=1.0, nd=1.0, should_sample=False):
         '''
         Evaluate minibatch SGHMC updates for a given batch.
         Args:
@@ -706,13 +721,13 @@ class Model(nn.Module):
                     noise = noise_scale * torch.randn_like(p)
                     
                     # Update momentum (v) using SGHMC update rule
-                    v = v * (1 - self.momentum_decay) + lr * grad_U + noise
+                    v = v * (1 - self.momentum_decay) - lr * grad_U + noise
                     
                     # Store updated momentum
                     self.momentum_buffer[pname] = v
                     
                     # Update gradient using momentum
-                    p.grad = v.clone()
+                    p.grad = -v.clone()
         
         return loss.item(), out.detach()
 
