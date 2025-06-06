@@ -38,7 +38,8 @@ class CyclicalSGMCMC:
         # If we're in the sampling/exploitation phase, keep learning rate constant
         if cycle_pos >= self.proportion_exploration:
             # Return the learning rate at the exploration/exploitation boundary
-            return self.base_lr * (1 + np.cos(self.proportion_exploration * np.pi)) / 2
+            # return self.base_lr * (1 + np.cos(self.proportion_exploration * np.pi)) / 2
+            return self.base_lr * (1 + np.cos(cycle_pos * np.pi)) / 2
         else:
             # In exploration phase, continue with normal cosine schedule
             return self.base_lr * (1 + np.cos(cycle_pos * np.pi)) / 2
