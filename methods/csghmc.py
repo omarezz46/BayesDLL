@@ -115,6 +115,17 @@ class Runner:
             prn_str += f'loss = {losses_train[ep]:.4f}, prediction error = {errors_train[ep]:.4f} '
             prn_str += f'(time: {toc-tic:.4f} seconds)'
             logger.info(prn_str)
+            if val_loader is not None:
+                if ep % 5 == 0 or ep == args.epochs - 1:
+                    tic_pe_val = time.time()
+                    pe_loss_val, pe_err_val = self.evaluate_point_estimate(val_loader, self.net, desc_prefix=f"PE Val (Cycle {self.current_cycle} Mean)")
+                    toc_pe_val = time.time()
+                    # pe_losses_val[ep] = pe_loss_val # Store if needed
+                    # pe_errors_val[ep] = pe_err_val # Store if needed
+                    prn_str_pe_val = f'(Epoch {ep}) Point Estimate Val (Cycle {self.current_cycle} Mean): '
+                    prn_str_pe_val += f'loss = {pe_loss_val:.4f}, prediction error = {pe_err_val:.4f} '
+                    prn_str_pe_val += f'(time: {toc_pe_val-tic_pe_val:.4f} seconds)'
+                    logger.info(prn_str_pe_val)
             
             # Test evaluation at the end of each cycle or if a cycle was completed during the epoch
             if cycle_updated : #or (ep % args.test_eval_freq == 0 and ep > 0)
@@ -197,6 +208,40 @@ class Runner:
             'samples_per_cycle': self.samples_per_cycle
         }
 
+    def evaluate_point_estimate(self, data_loader, net_to_evaluate, desc_prefix="Point Estimate"):
+        '''
+        Evaluate the given network (point estimate) on the data_loader.
+        
+        Returns:
+            loss = averaged CE loss
+            err = averaged prediction error
+        '''
+        args = self.args
+        net_to_evaluate.eval() # Ensure evaluation mode
+
+        loss, error, nb_samples = 0, 0, 0
+        
+        with torch.no_grad(): # Important: disable gradient calculations
+            with tqdm(data_loader, unit="batch", desc=f"{desc_prefix} Eval") as tepoch:
+                for x, y in tepoch:
+                    x, y = x.to(args.device), y.to(args.device)
+                    
+                    out = net_to_evaluate(x)
+                    
+                    loss_batch = self.criterion(out, y)
+                    pred = out.data.max(dim=1)[1]
+                    err_batch = pred.ne(y.data).sum()
+                    
+                    loss += loss_batch.item() * len(y)
+                    error += err_batch.item()
+                    nb_samples += len(y)
+                    
+                    tepoch.set_postfix(loss=loss/nb_samples if nb_samples > 0 else 0, error=error/nb_samples if nb_samples > 0 else 0)
+        
+        if nb_samples == 0:
+            return 0.0, 0.0 # Avoid division by zero if data_loader is empty
+            
+        return loss/nb_samples, error/nb_samples
 
     def train_one_epoch(self, train_loader):
         '''
@@ -256,7 +301,7 @@ class Runner:
                 if hasattr(args, 'clip_grad') and args.clip_grad is not None:
                     torch.nn.utils.clip_grad_norm_(self.net.parameters(), args.clip_grad)
 
-                self.optimizer.step()  # update self.net (ie, theta)
+                # self.optimizer.step()  # update self.net (ie, theta)
                 
                 # Prediction on training
                 pred = out.data.max(dim=1)[1]
@@ -692,7 +737,7 @@ class Model(nn.Module):
         # Evaluate NLL loss
         loss = criterion(out, y)
 
-        # Gradient d{loss_nll}/d{theta}
+        # Gradient d{loss_nll}/d{theta} 
         net.zero_grad()
         loss.backward()
         
@@ -712,22 +757,25 @@ class Model(nn.Module):
                     
                     # Compute gradient term including prior
                     if 'bias' in pname and bias == 'uninformative':
-                        grad_U = p.grad  # Only data likelihood gradient
+                        grad_U = p.grad + self.prior_sig * p.data # Only data likelihood gradient
                     else:
-                        grad_U = p.grad + (p - p0) / (self.prior_sig**2) / N  # Prior + likelihood gradient
+                        grad_U = p.grad + self.prior_sig * p.data   # Prior + likelihood gradient
                     
                     # Noise term
-                    noise_scale = nd * np.sqrt(2 * self.momentum_decay / (N * lr))
+                    noise_scale = nd * np.sqrt((2 * self.momentum_decay * lr))/ N 
                     noise = noise_scale * torch.randn_like(p)
                     
-                    # Update momentum (v) using SGHMC update rule
-                    v = v * (1 - self.momentum_decay) - lr * grad_U + noise
+                    #add noise only if in sampling phase
+                    if should_sample :
+                        v = v * (1 - self.momentum_decay) - lr * grad_U + noise
+                    else:
+                        v = v * (1 - self.momentum_decay) - lr * grad_U 
                     
                     # Store updated momentum
                     self.momentum_buffer[pname] = v
                     
                     # Update gradient using momentum
-                    p.grad = -v.clone()
+                    p.data.add_(v)
         
         return loss.item(), out.detach()
 
